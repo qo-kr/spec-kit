@@ -27,7 +27,7 @@ import yaml
 from packaging import version as pkg_version
 from packaging.specifiers import SpecifierSet, InvalidSpecifier
 
-from .extensions import ExtensionRegistry, normalize_priority
+from .extensions import REINSTALL_COMMAND, ExtensionRegistry, normalize_priority
 
 
 def _substitute_core_template(
@@ -136,12 +136,25 @@ class PresetManifest:
     def _load_yaml(self, path: Path) -> dict:
         """Load YAML file safely."""
         try:
-            with open(path, 'r') as f:
-                return yaml.safe_load(f) or {}
+            with open(path, 'r', encoding='utf-8') as f:
+                data = yaml.safe_load(f)
         except yaml.YAMLError as e:
             raise PresetValidationError(f"Invalid YAML in {path}: {e}")
         except FileNotFoundError:
             raise PresetValidationError(f"Manifest not found: {path}")
+        except UnicodeDecodeError as e:
+            raise PresetValidationError(
+                f"Manifest is not valid UTF-8: {path} ({e.reason} at byte {e.start})"
+            )
+        except OSError as e:
+            raise PresetValidationError(f"Could not read manifest {path}: {e}")
+        if data is None:
+            return {}
+        if not isinstance(data, dict):
+            raise PresetValidationError(
+                f"Manifest must be a YAML mapping, got {type(data).__name__}: {path}"
+            )
+        return data
 
     def _validate(self):
         """Validate manifest structure and required fields."""
@@ -563,7 +576,7 @@ class PresetManager:
                 raise PresetCompatibilityError(
                     f"Preset requires spec-kit {required}, "
                     f"but {speckit_version} is installed.\n"
-                    f"Upgrade spec-kit with: uv tool install specify-cli --force"
+                    f"Upgrade spec-kit with: {REINSTALL_COMMAND}"
                 )
         except InvalidSpecifier:
             raise PresetCompatibilityError(
@@ -1831,6 +1844,22 @@ class PresetCatalog:
                 "Catalog URL must be a valid URL with a host."
             )
 
+    def _make_request(self, url: str):
+        """Build a urllib Request, adding auth headers when a provider matches.
+
+        Delegates to :func:`specify_cli.authentication.http.build_request`.
+        """
+        from specify_cli.authentication.http import build_request
+        return build_request(url)
+
+    def _open_url(self, url: str, timeout: int = 10):
+        """Open a URL with provider-based auth, trying each configured provider.
+
+        Delegates to :func:`specify_cli.authentication.http.open_url`.
+        """
+        from specify_cli.authentication.http import open_url
+        return open_url(url, timeout)
+
     def _load_catalog_config(self, config_path: Path) -> Optional[List[PresetCatalogEntry]]:
         """Load catalog stack configuration from a YAML file.
 
@@ -2013,10 +2042,7 @@ class PresetCatalog:
                 pass
 
         try:
-            import urllib.request
-            import urllib.error
-
-            with urllib.request.urlopen(entry.url, timeout=10) as response:
+            with self._open_url(entry.url, timeout=10) as response:
                 catalog_data = json.loads(response.read())
 
             if (
@@ -2109,10 +2135,7 @@ class PresetCatalog:
                 pass
 
         try:
-            import urllib.request
-            import urllib.error
-
-            with urllib.request.urlopen(catalog_url, timeout=10) as response:
+            with self._open_url(catalog_url, timeout=10) as response:
                 catalog_data = json.loads(response.read())
 
             if (
@@ -2231,7 +2254,6 @@ class PresetCatalog:
         Raises:
             PresetError: If pack not found or download fails
         """
-        import urllib.request
         import urllib.error
 
         pack_info = self.get_pack_info(pack_id)
@@ -2283,7 +2305,7 @@ class PresetCatalog:
         zip_path = target_dir / zip_filename
 
         try:
-            with urllib.request.urlopen(download_url, timeout=60) as response:
+            with self._open_url(download_url, timeout=60) as response:
                 zip_data = response.read()
 
             zip_path.write_bytes(zip_data)

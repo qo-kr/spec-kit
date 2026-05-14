@@ -98,7 +98,7 @@ Multiple composing presets chain recursively. For example, a security preset wit
 Presets are discovered through catalogs. By default, Spec Kit uses the official and community catalogs:
 
 > [!NOTE]
-> Community presets are independently created and maintained by their respective authors. GitHub and the Spec Kit maintainers may review pull requests that add entries to the community catalog for formatting, catalog structure, or policy compliance, but they do **not review, audit, endorse, or support the preset code itself**. Review preset source code before installation and use at your own discretion.
+> Community presets are independently created and maintained by their respective authors. Maintainers only verify that catalog entries are complete and correctly formatted — they do **not review, audit, endorse, or support the preset code itself**. Review preset source code before installation and use at your own discretion.
 
 ```bash
 # List active catalogs
@@ -123,9 +123,25 @@ See [scaffold/](scaffold/) for a scaffold you can copy to create your own preset
 
 ## Environment Variables
 
-| Variable | Description |
-|----------|-------------|
-| `SPECKIT_PRESET_CATALOG_URL` | Override the catalog URL (replaces all defaults) |
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `SPECKIT_PRESET_CATALOG_URL` | Override the full catalog stack with a single URL (replaces all defaults) | Built-in default stack |
+| `GH_TOKEN` / `GITHUB_TOKEN` | GitHub token for authenticated requests to GitHub-hosted URLs (`raw.githubusercontent.com`, `github.com`, `api.github.com`, `codeload.github.com`). Required when your catalog JSON or preset ZIPs are hosted in a private GitHub repository. | None |
+
+#### Example: Using a private GitHub-hosted catalog
+
+```bash
+# Authenticate with a token (gh CLI, PAT, or GITHUB_TOKEN in CI)
+export GITHUB_TOKEN=$(gh auth token)
+
+# Search a private catalog added via `specify preset catalog add`
+specify preset search my-template
+
+# Install from a private catalog
+specify preset add my-template
+```
+
+The token is attached automatically to requests targeting GitHub domains. Non-GitHub catalog URLs are always fetched without credentials.
 
 ## Configuration Files
 

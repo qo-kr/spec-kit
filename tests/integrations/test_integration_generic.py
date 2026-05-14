@@ -101,6 +101,7 @@ class TestGenericIntegration:
             assert "{SCRIPT}" not in content, f"{f.name} has unprocessed {{SCRIPT}}"
             assert "__AGENT__" not in content, f"{f.name} has unprocessed __AGENT__"
             assert "{ARGS}" not in content, f"{f.name} has unprocessed {{ARGS}}"
+            assert "__SPECKIT_COMMAND_" not in content, f"{f.name} has unprocessed __SPECKIT_COMMAND_*__"
 
     def test_all_files_tracked_in_manifest(self, tmp_path):
         i = get_integration("generic")
@@ -184,6 +185,16 @@ class TestGenericIntegration:
         )
         assert "__CONTEXT_FILE__" not in content
 
+    def test_implement_loads_constitution_context(self, tmp_path):
+        """The generated implement command should load constitution governance context."""
+        i = get_integration("generic")
+        m = IntegrationManifest("generic", tmp_path)
+        i.setup(tmp_path, m, parsed_options={"commands_dir": ".custom/cmds"})
+        implement_file = tmp_path / ".custom" / "cmds" / "speckit.implement.md"
+        assert implement_file.exists()
+        content = implement_file.read_text(encoding="utf-8")
+        assert ".specify/memory/constitution.md" in content
+
     # -- CLI --------------------------------------------------------------
 
     def test_cli_generic_without_commands_dir_fails(self, tmp_path):
@@ -263,6 +274,7 @@ class TestGenericIntegration:
             ".specify/scripts/bash/common.sh",
             ".specify/scripts/bash/create-new-feature.sh",
             ".specify/scripts/bash/setup-plan.sh",
+            ".specify/scripts/bash/setup-tasks.sh",
             ".specify/templates/checklist-template.md",
             ".specify/templates/constitution-template.md",
             ".specify/templates/plan-template.md",
@@ -318,6 +330,7 @@ class TestGenericIntegration:
             ".specify/scripts/powershell/common.ps1",
             ".specify/scripts/powershell/create-new-feature.ps1",
             ".specify/scripts/powershell/setup-plan.ps1",
+            ".specify/scripts/powershell/setup-tasks.ps1",
             ".specify/templates/checklist-template.md",
             ".specify/templates/constitution-template.md",
             ".specify/templates/plan-template.md",
