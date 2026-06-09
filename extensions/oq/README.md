@@ -1,6 +1,6 @@
 # OQ Workflow Pack
 
-Bundled OQ-specific Speckit workflows for preparation, collaborative review, document review, and full-auto execution.
+Bundled OQ-specific Speckit workflows for preparation, automated review, and full-auto execution.
 
 ## Install
 
@@ -19,25 +19,20 @@ specify extension add --dev /path/to/spec-kit/extensions/oq
 Canonical names:
 
 - `speckit.oq.prepare`
-- `speckit.oq.collab-review`
 - `speckit.oq.auto-review`
 - `speckit.oq.auto-review-strict`
-- `speckit.oq.doc-review`
 - `speckit.oq.full-auto`
 
 Alias names preserved for the existing OQ workflow:
 
 - `speckit.prepare`
-- `speckit.collab-review`
 - `speckit.auto-review`
 - `speckit.auto-review-strict`
-- `speckit.doc-review`
 - `speckit.full-auto`
 
 When a project uses agent skills, installing this extension also registers the alias forms as project-local skills such as `.agents/skills/speckit-prepare/` and `.agents/skills/speckit-full-auto/`.
 
 ## Notes
 
-- `prepare`, `collab-review`, `auto-review`, and `full-auto` assume a GitHub-backed workflow and reference `git`, `gh`, and `codex` where available.
-- `doc-review` can run without `gh`, but will skip issue automation when GitHub CLI is unavailable.
+- `prepare`, `auto-review`, and `full-auto` assume a GitHub-backed workflow and reference `git`, `gh`, and `codex` where available.
 - These commands intentionally preserve the existing OQ wording and `specs/{feature}` conventions.

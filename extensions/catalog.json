@@ -51,7 +51,7 @@
       "name": "OQ Workflow Pack",
       "id": "oq",
       "version": "1.0.0",
-      "description": "OQ team's extended Speckit workflows for preparation, collaborative review, document review, and full-auto execution.",
+      "description": "OQ team's extended Speckit workflows for preparation, automated review, and full-auto execution.",
       "author": "qo-kr",
       "repository": "https://github.com/qo-kr/spec-kit",
       "bundled": true,

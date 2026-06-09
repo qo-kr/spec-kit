@@ -98,7 +98,7 @@ Output a summary:
 🌿 브랜치: `{branch}`
 
 **다음 단계**:
-- `/speckit.collab-review {ARGS}` — 코덱스와 협업 리뷰 시작
+- `/speckit.auto-review {ARGS}` — 코덱스 자동 리뷰 시작
 - `/speckit.implement {ARGS}` — 리뷰 없이 바로 구현 시작
 ```
 

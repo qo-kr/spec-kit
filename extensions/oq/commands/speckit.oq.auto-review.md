@@ -38,7 +38,7 @@ If any check fails, report and suggest fix before proceeding.
 
 ### Step 1: Detect Stage + Generate Context
 
-Same as `speckit.collab-review` — detect SPEC/PLAN/IMPLEMENTATION/FINAL_REVIEW.
+Detect SPEC/PLAN/IMPLEMENTATION/FINAL_REVIEW from the current spec-kit artifacts.
 
 ### Step 1.5: Three Review Axes
 
@@ -178,7 +178,7 @@ Look for these in order:
 - Maximum 10 rounds — if not converging, stop and report
 - Each round: codex review + parse + fix + test + commit + push
 - Post every round to the tracking GitHub issue
-- If codex review command fails (timeout, auth error), fall back to manual mode (suggest `/speckit.collab-review`)
+- If codex review command fails (timeout, auth error), stop and report the exact command, stderr, and next manual recovery step
 - Never ignore findings — fix or defer with explanation
 - Honestly mark stubs or placeholders
 
@@ -187,8 +187,8 @@ Look for these in order:
 If `codex` CLI is not available or fails:
 
 ```text
-⚠️ codex CLI not available. Falling back to manual mode.
-Use `/speckit.collab-review {ARGS}` instead.
+⚠️ codex CLI not available. Automated review cannot continue.
+Install or authenticate Codex, then retry `/speckit.auto-review {ARGS}`.
 ```
 
 ## Context

@@ -23,11 +23,15 @@ class TestOqExtensionManifest:
         manifest = ExtensionManifest(EXT_DIR / "extension.yml")
         commands = {command["name"]: command.get("aliases", []) for command in manifest.commands}
 
+        assert set(commands) == {
+            "speckit.oq.prepare",
+            "speckit.oq.auto-review",
+            "speckit.oq.auto-review-strict",
+            "speckit.oq.full-auto",
+        }
         assert commands["speckit.oq.prepare"] == ["speckit.prepare"]
-        assert commands["speckit.oq.collab-review"] == ["speckit.collab-review"]
         assert commands["speckit.oq.auto-review"] == ["speckit.auto-review"]
         assert commands["speckit.oq.auto-review-strict"] == ["speckit.auto-review-strict"]
-        assert commands["speckit.oq.doc-review"] == ["speckit.doc-review"]
         assert commands["speckit.oq.full-auto"] == ["speckit.full-auto"]
 
     def test_manifest_command_files_exist(self):
@@ -97,3 +101,7 @@ class TestOqExtensionInstall:
         assert (skills_dir / "speckit-prepare" / "SKILL.md").is_file()
         assert (skills_dir / "speckit-oq-full-auto" / "SKILL.md").is_file()
         assert (skills_dir / "speckit-full-auto" / "SKILL.md").is_file()
+        assert not (skills_dir / "speckit-oq-collab-review").exists()
+        assert not (skills_dir / "speckit-collab-review").exists()
+        assert not (skills_dir / "speckit-oq-doc-review").exists()
+        assert not (skills_dir / "speckit-doc-review").exists()

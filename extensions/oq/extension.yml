@@ -4,7 +4,7 @@ extension:
   id: oq
   name: "OQ Workflow Pack"
   version: "1.0.0"
-  description: "OQ team's extended Speckit workflows for preparation, collaborative review, document review, and full-auto execution."
+  description: "OQ team's extended Speckit workflows for preparation, automated review, and full-auto execution."
   author: qo-kr
   repository: https://github.com/qo-kr/spec-kit
   license: MIT
@@ -33,10 +33,6 @@ provides:
       file: commands/speckit.oq.prepare.md
       description: "Run OQ's batched speckit preparation flow from specify through analyze."
       aliases: ["speckit.prepare"]
-    - name: speckit.oq.collab-review
-      file: commands/speckit.oq.collab-review.md
-      description: "Run the collaborative Claude plus Codex review loop with the user as relay."
-      aliases: ["speckit.collab-review"]
     - name: speckit.oq.auto-review
       file: commands/speckit.oq.auto-review.md
       description: "Run OQ's fully automated Codex-backed review loop."
@@ -45,10 +41,6 @@ provides:
       file: commands/speckit.oq.auto-review-strict.md
       description: "Run OQ's strict automated review loop including LOW severity findings."
       aliases: ["speckit.auto-review-strict"]
-    - name: speckit.oq.doc-review
-      file: commands/speckit.oq.doc-review.md
-      description: "Run OQ's multi-round Markdown and spec document review workflow."
-      aliases: ["speckit.doc-review"]
     - name: speckit.oq.full-auto
       file: commands/speckit.oq.full-auto.md
       description: "Run OQ's end-to-end spec-to-merge pipeline."
