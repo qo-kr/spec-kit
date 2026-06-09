@@ -71,7 +71,7 @@ class TestOqExtensionInstall:
                 [
                     "init",
                     "--here",
-                    "--ai",
+                    "--integration",
                     "codex",
                     "--script",
                     "sh",
