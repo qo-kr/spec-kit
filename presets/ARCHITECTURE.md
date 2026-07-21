@@ -99,7 +99,7 @@ The `CommandRegistrar` renders commands differently per agent:
 
 | Agent | Format | Extension | Arg placeholder |
 |-------|--------|-----------|-----------------|
-| Claude, Cursor, opencode, Windsurf, etc. | Markdown | `.md` | `$ARGUMENTS` |
+| Claude, Kilo Code, opencode, etc. | Markdown | `.md` | `$ARGUMENTS` |
 | Copilot | Markdown | `.agent.md` + `.prompt.md` | `$ARGUMENTS` |
 | Gemini, Qwen, Tabnine | TOML | `.toml` | `{{args}}` |
 
@@ -158,8 +158,7 @@ presets/
         ├── plan-template.md
         ├── tasks-template.md
         ├── checklist-template.md
-        ├── constitution-template.md
-        └── agent-file-template.md
+        └── constitution-template.md
 ```
 
 ## Module Structure

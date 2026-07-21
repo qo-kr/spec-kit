@@ -67,6 +67,37 @@ class TestCatalogURLValidation:
         with pytest.raises(IntegrationCatalogError, match="valid URL"):
             IntegrationCatalog._validate_catalog_url("https:///no-host")
 
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://:8080",                # port only, no host
+            "https://:8080/catalog.json",   # port only, with path
+            "https://:0",                   # port only, no host
+            "https://user@",                # userinfo only, no host
+            "https://user:pass@",           # userinfo only, no host
+        ],
+    )
+    def test_hostless_url_with_truthy_netloc_rejected(self, url):
+        # These have a truthy netloc (":8080", "user@") but no actual host,
+        # so a netloc-based check would wrongly accept them despite the
+        # "valid URL with a host" promise. hostname is None for all of them (#3209).
+        with pytest.raises(IntegrationCatalogError, match="valid URL"):
+            IntegrationCatalog._validate_catalog_url(url)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://[::1",                 # unclosed ipv6 bracket
+            "https://[not-an-ip]/c.json",   # bracketed non-ip host
+        ],
+    )
+    def test_malformed_url_rejected_cleanly(self, url):
+        # A malformed authority makes urlparse/hostname raise ValueError. The
+        # validator must turn that into its normal catalog error, not leak a
+        # raw ValueError to the caller.
+        with pytest.raises(IntegrationCatalogError, match="malformed"):
+            IntegrationCatalog._validate_catalog_url(url)
+
 
 # ---------------------------------------------------------------------------
 # IntegrationCatalog — active catalogs
@@ -458,7 +489,6 @@ class TestIntegrationListCatalog:
                 "init", "--here",
                 "--integration", "copilot",
                 "--script", "sh",
-                "--no-git",
                 "--ignore-agent-tools",
             ], catch_exceptions=False)
         finally:
@@ -556,7 +586,6 @@ class TestIntegrationUpgrade:
                 "init", "--here",
                 "--integration", integration,
                 "--script", "sh",
-                "--no-git",
                 "--ignore-agent-tools",
             ], catch_exceptions=False)
         finally:
@@ -575,7 +604,7 @@ class TestIntegrationUpgrade:
         finally:
             os.chdir(old)
         assert result.exit_code != 0
-        assert "Not a spec-kit project" in result.output
+        assert "Not a Spec Kit project" in result.output
 
     def test_upgrade_no_integration_installed(self, tmp_path):
         from typer.testing import CliRunner
@@ -892,6 +921,57 @@ class TestCatalogSourceManagement:
         message = str(exc_info.value)
         assert str(cfg_path) in message
         assert "expected a mapping" in message
+
+    def test_add_catalog_rejects_inf_priority_in_existing_entry(
+        self, tmp_path, monkeypatch
+    ):
+        # ``priority: .inf`` loads as float('inf'); int() on it raises
+        # OverflowError, which used to escape the IntegrationValidationError
+        # contract as a raw traceback (github/spec-kit#3526 fixed the sibling
+        # workflow/step loaders the same way).
+        self._isolate(tmp_path, monkeypatch)
+        cfg_path = tmp_path / ".specify" / "integration-catalogs.yml"
+        cfg_path.write_text(
+            yaml.dump(
+                {
+                    "catalogs": [
+                        {
+                            "url": "https://a.example.com/catalog.json",
+                            "priority": float("inf"),
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        cat = IntegrationCatalog(tmp_path)
+        with pytest.raises(
+            IntegrationValidationError, match="must be an integer"
+        ):
+            cat.add_catalog("https://new.example.com/catalog.json")
+
+    def test_remove_catalog_tolerates_inf_priority(self, tmp_path, monkeypatch):
+        # Building the remove display order must not crash on a ``priority:
+        # .inf`` entry; it falls back to positional order like the other
+        # non-integer priorities do.
+        self._isolate(tmp_path, monkeypatch)
+        cfg_path = tmp_path / ".specify" / "integration-catalogs.yml"
+        cfg_path.write_text(
+            yaml.dump(
+                {
+                    "catalogs": [
+                        {
+                            "url": "https://a.example.com/catalog.json",
+                            "priority": float("inf"),
+                        },
+                        {"url": "https://b.example.com/catalog.json", "priority": 2},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        cat = IntegrationCatalog(tmp_path)
+        cat.remove_catalog(0)  # must not raise OverflowError
 
     def test_add_catalog_skips_blank_url_entries(self, tmp_path, monkeypatch):
         self._isolate(tmp_path, monkeypatch)

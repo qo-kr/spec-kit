@@ -1,13 +1,16 @@
-"""Shared GitHub-authenticated HTTP helpers.
+"""Shared GitHub HTTP request helpers.
 
-Used by both ExtensionCatalog and PresetCatalog to attach
-GITHUB_TOKEN / GH_TOKEN credentials to requests targeting
-GitHub-hosted domains, while preventing token leakage to
-third-party hosts on redirects.
+Provides ``build_github_request()`` for attaching GITHUB_TOKEN / GH_TOKEN
+credentials to requests targeting GitHub-hosted domains, and
+``resolve_github_release_asset_api_url()`` — used by extensions, presets,
+and workflow URL resolution — to translate browser release-download URLs
+into GitHub REST API asset URLs. Authenticated downloads themselves go
+through the config-driven helpers in :mod:`specify_cli.authentication.http`.
 """
 
 import os
 import urllib.request
+from fnmatch import fnmatch
 from typing import Callable, Dict, Optional
 from urllib.parse import quote, unquote, urlparse
 
@@ -21,6 +24,7 @@ GITHUB_HOSTS = frozenset({
     "api.github.com",
     "codeload.github.com",
 })
+_MAX_RELEASE_METADATA_BYTES = 5 * 1024 * 1024
 
 
 def build_github_request(url: str) -> urllib.request.Request:
@@ -54,77 +58,90 @@ def build_github_request(url: str) -> urllib.request.Request:
     return urllib.request.Request(url, headers=headers)
 
 
-class _StripAuthOnRedirect(urllib.request.HTTPRedirectHandler):
-    """Redirect handler that drops the Authorization header when leaving GitHub.
-
-    Prevents token leakage to CDNs or other third-party hosts that GitHub
-    may redirect to (e.g. S3 for release asset downloads, objects.githubusercontent.com).
-    Auth is preserved as long as the redirect target remains within GITHUB_HOSTS.
-    """
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        original_auth = req.get_header("Authorization")
-        new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
-        if new_req is not None:
-            hostname = (urlparse(newurl).hostname or "").lower()
-            if hostname in GITHUB_HOSTS:
-                if original_auth:
-                    new_req.add_unredirected_header("Authorization", original_auth)
-            else:
-                new_req.headers.pop("Authorization", None)
-                new_req.unredirected_hdrs.pop("Authorization", None)
-        return new_req
+def _host_matches(hostname: str, patterns: tuple[str, ...]) -> bool:
+    """Return True when *hostname* matches a pattern (exact or ``*.suffix``)."""
+    hostname = hostname.lower()
+    return any(p == hostname or fnmatch(hostname, p) for p in patterns)
 
 
 def resolve_github_release_asset_api_url(
     download_url: str,
     open_url_fn: Callable,
     timeout: int = 60,
+    github_hosts: tuple[str, ...] = (),
+    redirect_validator: Callable[[str, str], None] | None = None,
+    max_metadata_bytes: int = _MAX_RELEASE_METADATA_BYTES,
 ) -> Optional[str]:
-    """Resolve a GitHub browser release URL to its REST API asset URL.
+    """Resolve a GitHub release browser-download URL to its REST API asset URL.
 
-    For private or SSO-protected repositories, browser release download
-    URLs (``https://github.com/<owner>/<repo>/releases/download/<tag>/<asset>``)
-    redirect to an HTML/SSO page instead of delivering the file.  This
-    helper resolves such a URL to the matching GitHub REST API asset URL
-    (``https://api.github.com/repos/…/releases/assets/<id>``), which can
-    then be downloaded with ``Accept: application/octet-stream`` and an
-    auth token to retrieve the actual file payload.
+    Works for public ``github.com`` and for GitHub Enterprise Server (GHES)
+    hosts. A host is treated as GHES when it matches one of *github_hosts*
+    (exact hostname or ``*.suffix``) — supply the hosts the user has trusted
+    under a ``github`` provider in ``auth.json``. This allowlist is the
+    security gate: unlisted hosts never receive GHES API treatment, so a
+    malicious catalog cannot induce an API request to an arbitrary host.
 
-    If *download_url* is already a REST API asset URL, it is returned
-    as-is.  Non-GitHub URLs and GitHub URLs that are not release-download
-    URLs return ``None``.  If the API lookup fails (e.g. network error or
-    asset not found), ``None`` is returned so callers can fall back to the
-    original URL.
+    For a public URL the API base is ``https://api.github.com``; for a GHES
+    host it is ``{scheme}://{host[:port]}/api/v3``. Returns the API asset URL
+    (downloadable with ``Accept: application/octet-stream`` + a token), the
+    input unchanged if it is already an API asset URL, or ``None`` when the
+    URL is not a resolvable GitHub release download or the lookup fails.
 
     Args:
         download_url: The URL to resolve.
         open_url_fn: A callable compatible with
-            ``specify_cli.authentication.http.open_url`` used to make the
-            authenticated API request.
+            ``specify_cli.authentication.http.open_url`` used for the
+            authenticated release-metadata lookup.
         timeout: Per-request timeout in seconds.
-
-    Returns:
-        The resolved REST API asset URL, or ``None`` if resolution is not
-        applicable or fails.
+        github_hosts: Host patterns to treat as GitHub Enterprise Server.
+        redirect_validator: Optional policy applied to metadata redirects.
+        max_metadata_bytes: Maximum release-metadata response size.
     """
     import json
     import urllib.error
 
     parsed = urlparse(download_url)
+    hostname = (parsed.hostname or "").lower()
     parts = [unquote(part) for part in parsed.path.strip("/").split("/")]
 
-    # Already a REST API asset URL — use it directly
-    if (
-        parsed.hostname == "api.github.com"
-        and len(parts) >= 6
-        and parts[:1] == ["repos"]
-        and parts[3:5] == ["releases", "assets"]
-    ):
+    is_ghes = (
+        bool(hostname)
+        and hostname not in GITHUB_HOSTS
+        and _host_matches(hostname, github_hosts)
+    )
+
+    def _is_asset_path(segments: list[str]) -> bool:
+        return (
+            len(segments) >= 6
+            and segments[:1] == ["repos"]
+            and segments[3:5] == ["releases", "assets"]
+        )
+
+    # Already a REST API asset URL — use it directly. Pure passthrough induces
+    # no new request: the caller fetches this same URL regardless, so it is
+    # gated on path shape alone rather than the GHES allowlist. The token stays
+    # independently gated by auth.json in the download helper, and only the
+    # resolving path below (which issues a tag-lookup request) needs the
+    # allowlist as its anti-SSRF gate.
+    if hostname == "api.github.com" and _is_asset_path(parts):
+        return download_url
+    if hostname and parts[:2] == ["api", "v3"] and _is_asset_path(parts[2:]):
         return download_url
 
-    # Only handle github.com browser release download URLs
-    if parsed.hostname != "github.com":
+    # Determine the REST API base for browser release-download URLs.
+    if hostname == "github.com":
+        api_base = "https://api.github.com"
+    elif is_ghes:
+        # ``parsed.port`` raises ValueError on a malformed port (e.g.
+        # ``host:notaport``); the function's contract is to return None for
+        # anything it can't resolve, not to raise.
+        try:
+            port = parsed.port
+        except ValueError:
+            return None
+        authority = hostname if port is None else f"{hostname}:{port}"
+        api_base = f"{parsed.scheme}://{authority}/api/v3"
+    else:
         return None
 
     # Expecting /<owner>/<repo>/releases/download/<tag>/<asset>
@@ -134,33 +151,36 @@ def resolve_github_release_asset_api_url(
     owner, repo, tag = parts[0], parts[1], parts[4]
     asset_name = "/".join(parts[5:])
     encoded_tag = quote(tag, safe="")
-    release_url = f"https://api.github.com/repos/{owner}/{repo}/releases/tags/{encoded_tag}"
+    release_url = f"{api_base}/repos/{owner}/{repo}/releases/tags/{encoded_tag}"
 
     try:
-        with open_url_fn(release_url, timeout=timeout) as response:
-            release_data = json.loads(response.read())
-    except (urllib.error.URLError, json.JSONDecodeError):
+        open_kwargs = {"timeout": timeout}
+        if redirect_validator is not None:
+            open_kwargs["redirect_validator"] = redirect_validator
+        with open_url_fn(release_url, **open_kwargs) as response:
+            raw_release_data = response.read(max_metadata_bytes + 1)
+            if len(raw_release_data) > max_metadata_bytes:
+                raise ValueError("GitHub release metadata exceeds size limit")
+            release_data = json.loads(raw_release_data)
+    except (
+        urllib.error.URLError,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+    ):
         return None
 
-    for asset in release_data.get("assets", []):
-        if asset.get("name") == asset_name and asset.get("url"):
+    if not isinstance(release_data, dict):
+        return None
+    assets = release_data.get("assets", [])
+    if not isinstance(assets, list):
+        return None
+    for asset in assets:
+        if (
+            isinstance(asset, dict)
+            and asset.get("name") == asset_name
+            and asset.get("url")
+        ):
             return str(asset["url"])
 
     return None
-
-
-def open_github_url(url: str, timeout: int = 10):
-    """Open a URL with GitHub auth, stripping the header on cross-host redirects.
-
-    When the request carries an Authorization header, a custom redirect
-    handler drops that header if the redirect target is not a GitHub-owned
-    domain, preventing token leakage to CDNs or other third-party hosts
-    that GitHub may redirect to (e.g. S3 for release asset downloads).
-    """
-    req = build_github_request(url)
-
-    if not req.get_header("Authorization"):
-        return urllib.request.urlopen(req, timeout=timeout)
-
-    opener = urllib.request.build_opener(_StripAuthOnRedirect)
-    return opener.open(req, timeout=timeout)

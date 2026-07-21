@@ -315,6 +315,20 @@ class TestFindEntriesForUrl:
     def test_empty_url_returns_empty(self):
         assert find_entries_for_url("", [_github_entry()]) == []
 
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://[::1",                 # unterminated ipv6 bracket
+            "https://[not-an-ip]/file",     # bracketed non-ip host
+        ],
+    )
+    def test_malformed_url_returns_empty(self, url):
+        # A malformed authority makes urlparse/hostname raise ValueError.
+        # Since no entry can match such a URL, this must return no matches
+        # (like a host-less URL) rather than leaking a raw ValueError out of
+        # the shared HTTP client.
+        assert find_entries_for_url(url, [_github_entry()]) == []
+
     def test_empty_entries_returns_empty(self):
         assert find_entries_for_url("https://github.com/org/repo", []) == []
 
@@ -486,6 +500,19 @@ class TestAzureDevOpsAuth:
             hosts=("dev.azure.com",), provider="azure-devops", auth="azure-cli",
         )
         with patch("specify_cli.authentication.azure_devops.subprocess.run", side_effect=OSError("not found")):
+            assert AzureDevOpsAuth().resolve_token(entry) is None
+
+    def test_resolve_token_azure_cli_undecodable_output_returns_none(self):
+        """Undecodable az output returns None, not a crash. With text=True,
+        subprocess.run decodes stdout with the locale encoding and raises
+        UnicodeDecodeError (not a JSONDecodeError) when it can't — the helper's
+        contract is to return None on any failure."""
+        from unittest.mock import patch
+        entry = AuthConfigEntry(
+            hosts=("dev.azure.com",), provider="azure-devops", auth="azure-cli",
+        )
+        boom = UnicodeDecodeError("utf-8", b"\xff\xfe", 0, 1, "invalid start byte")
+        with patch("specify_cli.authentication.azure_devops.subprocess.run", side_effect=boom):
             assert AzureDevOpsAuth().resolve_token(entry) is None
 
     def test_resolve_token_azure_ad_success(self, monkeypatch):
@@ -793,6 +820,35 @@ class TestRedirectStripping:
         assert new_req.headers.get("Authorization") is None
         assert new_req.unredirected_hdrs.get("Authorization") is None
 
+    def test_https_to_http_same_host_redirect_strips_auth(self):
+        from specify_cli.authentication.http import _StripAuthOnRedirect
+        from urllib.request import Request
+        import io
+        handler = _StripAuthOnRedirect(("github.com",))
+        req = Request("https://github.com/org/repo", headers={"Authorization": "Bearer tok"})
+        new_req = handler.redirect_request(req, io.BytesIO(b""), 302, "Found", {},
+                                           "http://github.com/org/repo")
+        assert new_req is not None
+        assert new_req.headers.get("Authorization") is None
+        assert new_req.unredirected_hdrs.get("Authorization") is None
+
+    def test_redirect_validator_can_reject_before_following_redirect(self):
+        import urllib.error
+        from specify_cli.authentication.http import _StripAuthOnRedirect
+        from urllib.request import Request
+        import io
+
+        def reject_http(old_url, new_url):
+            if new_url.startswith("http://"):
+                raise urllib.error.URLError("scheme downgrade")
+
+        handler = _StripAuthOnRedirect(("github.com",), reject_http)
+        req = Request("https://github.com/org/repo", headers={"Authorization": "Bearer tok"})
+
+        with pytest.raises(urllib.error.URLError, match="scheme downgrade"):
+            handler.redirect_request(req, io.BytesIO(b""), 302, "Found", {},
+                                     "http://github.com/org/repo")
+
     def test_multi_hop_redirect_within_hosts_preserves_auth(self):
         """Auth survives a multi-hop redirect chain within allowed hosts."""
         from specify_cli.authentication.http import _StripAuthOnRedirect
@@ -815,6 +871,22 @@ class TestRedirectStripping:
         assert req3 is not None
         auth3 = req3.get_header("Authorization") or req3.unredirected_hdrs.get("Authorization")
         assert auth3 == "Bearer tok"
+
+    def test_malformed_redirect_url_raises_urlerror_not_valueerror(self):
+        """A redirect to a malformed URL (unterminated IPv6 bracket) surfaces
+        as URLError, which download paths already handle, rather than an
+        unhandled ValueError traceback."""
+        import urllib.error
+        from specify_cli.authentication.http import _StripAuthOnRedirect
+        from urllib.request import Request
+        import io
+
+        handler = _StripAuthOnRedirect(("github.com",))
+        req = Request("https://github.com/org/repo")
+
+        with pytest.raises(urllib.error.URLError):
+            handler.redirect_request(req, io.BytesIO(b""), 302, "Found", {},
+                                     "https://[::1/asset")
 
 
 # ---------------------------------------------------------------------------
@@ -871,3 +943,45 @@ class TestFetchLatestReleaseTagDelegation:
         with patch("specify_cli.authentication.http.urllib.request.urlopen", side_effect=side_effect):
             _fetch_latest_release_tag()
         assert captured["request"].get_header("Accept") == "application/vnd.github+json"
+
+
+# ---------------------------------------------------------------------------
+# github_provider_hosts
+# ---------------------------------------------------------------------------
+
+
+class TestGithubProviderHosts:
+    """Tests for github_provider_hosts() — the GHES host allowlist source."""
+
+    def _set_config(self, monkeypatch, entries):
+        from specify_cli.authentication import http as _auth_http
+        monkeypatch.setattr(_auth_http, "_config_override", entries)
+
+    def test_returns_hosts_from_github_entries(self, monkeypatch):
+        from specify_cli.authentication.http import github_provider_hosts
+        self._set_config(monkeypatch, [
+            AuthConfigEntry(hosts=("ghes.example", "raw.ghes.example"),
+                            provider="github", auth="bearer", token="t"),
+        ])
+        assert github_provider_hosts() == ("ghes.example", "raw.ghes.example")
+
+    def test_empty_when_no_config(self, monkeypatch):
+        from specify_cli.authentication.http import github_provider_hosts
+        self._set_config(monkeypatch, [])
+        assert github_provider_hosts() == ()
+
+    def test_ignores_non_github_providers(self, monkeypatch):
+        from specify_cli.authentication.http import github_provider_hosts
+        self._set_config(monkeypatch, [
+            AuthConfigEntry(hosts=("dev.azure.com",), provider="azure-devops",
+                            auth="basic-pat", token="t"),
+        ])
+        assert github_provider_hosts() == ()
+
+    def test_unions_multiple_github_entries(self, monkeypatch):
+        from specify_cli.authentication.http import github_provider_hosts
+        self._set_config(monkeypatch, [
+            AuthConfigEntry(hosts=("ghes.example",), provider="github", auth="bearer", token="t"),
+            AuthConfigEntry(hosts=("github.com",), provider="github", auth="bearer", token="t"),
+        ])
+        assert github_provider_hosts() == ("ghes.example", "github.com")

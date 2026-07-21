@@ -41,7 +41,9 @@ class TestKiroCliIntegration(MarkdownIntegrationTests):
     FOLDER = ".kiro/"
     COMMANDS_SUBDIR = "prompts"
     REGISTRAR_DIR = ".kiro/prompts"
-    CONTEXT_FILE = "AGENTS.md"
+
+    def test_declares_multi_install_safe(self):
+        assert get_integration(self.KEY).multi_install_safe is True
 
     def test_registrar_config(self):
         """Override base assertion: kiro-cli uses a prose fallback for args
@@ -140,7 +142,7 @@ class TestKiroIntegration:
             runner = CliRunner()
             result = runner.invoke(app, [
                 "init", "--here", "--integration", "kiro-cli",
-                "--ignore-agent-tools", "--script", "sh", "--no-git",
+                "--ignore-agent-tools", "--script", "sh",
             ], catch_exceptions=False)
         finally:
             os.chdir(old_cwd)

@@ -43,6 +43,35 @@ class GateStep(StepBase):
         options = config.get("options", ["approve", "reject"])
         on_reject = config.get("on_reject", "abort")
 
+        # ``validate`` rejects a non-list (or empty) ``options``, and requires
+        # every option to be a string, but the engine does not auto-validate
+        # before ``execute``. An unvalidated run with a scalar/dict/None
+        # ``options`` would otherwise reach ``_prompt`` and crash the whole run
+        # with a raw ``TypeError`` (``enumerate``/``len`` on a non-iterable) or
+        # ``KeyError`` (indexing a dict); a non-string option would crash at the
+        # ``choice.lower()`` reject check with ``AttributeError``. Fail this step
+        # loudly instead — mirroring the switch 'cases' and command 'input'
+        # guards. Checked before the non-TTY short-circuit so the error surfaces
+        # in CI too, rather than PAUSING and crashing later on interactive resume.
+        if (
+            not isinstance(options, list)
+            or not options
+            or not all(isinstance(o, str) for o in options)
+        ):
+            return StepResult(
+                status=StepStatus.FAILED,
+                error=(
+                    f"Gate step {config.get('id', '?')!r}: 'options' must be a "
+                    f"non-empty list of strings, got {type(options).__name__}."
+                ),
+                output={
+                    "message": message,
+                    "options": options,
+                    "on_reject": on_reject,
+                    "choice": None,
+                },
+            )
+
         show_file = config.get("show_file")
         if isinstance(show_file, str) and "{{" in show_file:
             show_file = evaluate_expression(show_file, context)
@@ -73,7 +102,14 @@ class GateStep(StepBase):
         choice = self._prompt(self._compose_prompt(message, show_file), options)
         output["choice"] = choice
 
-        if choice in ("reject", "abort"):
+        # Match rejection case-insensitively. ``_prompt`` echoes the option's
+        # original casing, and ``validate`` accepts a reject option
+        # case-insensitively (``o.lower() in {"reject", "abort"}``), so a gate
+        # authored as ``options: [Approve, Reject]`` passes validation. Comparing
+        # ``choice`` case-sensitively here would then treat a ``Reject`` pick as
+        # approval and silently skip the abort — the reject path must agree with
+        # the check that let the option through.
+        if choice.lower() in ("reject", "abort"):
             if on_reject == "abort":
                 output["aborted"] = True
                 return StepResult(
@@ -194,7 +230,14 @@ class GateStep(StepBase):
                 f"Gate step {config.get('id', '?')!r}: 'on_reject' must be "
                 f"'abort', 'skip', or 'retry'."
             )
-        if on_reject in ("abort", "retry") and isinstance(options, list):
+        # Only inspect option text when every option is a string; otherwise the
+        # `o.lower()` below would raise AttributeError on a non-string option
+        # (already reported above) and break validate_workflow's never-raise contract.
+        if (
+            on_reject in ("abort", "retry")
+            and isinstance(options, list)
+            and all(isinstance(o, str) for o in options)
+        ):
             reject_choices = {"reject", "abort"}
             if not any(o.lower() in reject_choices for o in options):
                 errors.append(

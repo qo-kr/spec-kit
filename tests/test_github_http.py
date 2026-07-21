@@ -144,13 +144,51 @@ class TestResolveGitHubReleaseAssetApiUrl:
         @contextmanager
         def failing_open(url, timeout=None, extra_headers=None):
             raise urllib.error.URLError("network error")
-            yield  # noqa: unreachable
+            yield  # pragma: no cover
 
         result = resolve_github_release_asset_api_url(
             "https://github.com/org/repo/releases/download/v1/pack.zip",
             failing_open,
         )
         assert result is None
+
+    def test_metadata_lookup_is_bounded_and_redirect_validated(self):
+        """Release metadata reads stay bounded and use the caller's policy."""
+        captured = {}
+
+        class OversizedResponse:
+            def read(self, amount=None):
+                captured["read_amount"] = amount
+                return b"x" * amount
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        def redirect_validator(old_url, new_url):
+            return None
+
+        def fake_open(
+            url,
+            timeout=None,
+            extra_headers=None,
+            redirect_validator=None,
+        ):
+            captured["redirect_validator"] = redirect_validator
+            return OversizedResponse()
+
+        result = resolve_github_release_asset_api_url(
+            "https://github.com/org/repo/releases/download/v1/pack.zip",
+            fake_open,
+            redirect_validator=redirect_validator,
+            max_metadata_bytes=8,
+        )
+
+        assert result is None
+        assert captured["read_amount"] == 9
+        assert captured["redirect_validator"] is redirect_validator
 
     def test_tag_with_special_characters_is_url_encoded(self):
         """Tags with reserved characters (e.g. '/') are encoded in the API URL."""
@@ -188,3 +226,134 @@ class TestResolveGitHubReleaseAssetApiUrl:
         )
         assert len(captured_urls) == 1
         assert "releases/tags/v1%23beta" in captured_urls[0]
+
+    # --- GHES (GitHub Enterprise Server) ---
+
+    def test_resolves_ghes_browser_url_to_api_url(self):
+        """A GHES browser release URL resolves to the /api/v3 asset URL."""
+        release_json = {
+            "assets": [
+                {"name": "ext.zip",
+                 "url": "https://ghes.example/api/v3/repos/o/r/releases/assets/7"}
+            ]
+        }
+        result = resolve_github_release_asset_api_url(
+            "https://ghes.example/o/r/releases/download/v1/ext.zip",
+            self._make_open_url_fn(release_json),
+            github_hosts=("ghes.example",),
+        )
+        assert result == "https://ghes.example/api/v3/repos/o/r/releases/assets/7"
+
+    def test_passthrough_for_existing_ghes_api_asset_url(self):
+        """An already-resolved GHES /api/v3 asset URL is returned as-is."""
+        url = "https://ghes.example/api/v3/repos/o/r/releases/assets/7"
+        result = resolve_github_release_asset_api_url(
+            url, lambda *a, **kw: None, github_hosts=("ghes.example",)
+        )
+        assert result == url
+
+    def test_returns_none_for_ghes_host_not_in_allowlist(self):
+        """Unlisted hosts get no GHES treatment and trigger no API call (anti-SSRF)."""
+        called = []
+
+        @contextmanager
+        def recording_open(url, timeout=None, extra_headers=None):
+            called.append(url)
+            resp = MagicMock()
+            resp.read.return_value = b"{}"
+            yield resp
+
+        result = resolve_github_release_asset_api_url(
+            "https://ghes.example/o/r/releases/download/v1/ext.zip",
+            recording_open,
+            github_hosts=("other.example",),
+        )
+        assert result is None
+        assert called == []
+
+    def test_returns_none_on_malformed_ghes_port(self):
+        """A malformed port on an allowlisted GHES host returns None, not a
+        ValueError (contract: resolve or return None, never raise)."""
+        called = []
+
+        def open_never(url, timeout=None, extra_headers=None):
+            called.append(url)
+            raise AssertionError("open_url_fn must not be called")
+
+        result = resolve_github_release_asset_api_url(
+            "https://ghes.example:notaport/o/r/releases/download/v1/ext.zip",
+            open_never,
+            github_hosts=("ghes.example",),
+        )
+        assert result is None
+        assert called == []
+
+    def test_passthrough_for_unlisted_ghes_api_asset_url(self):
+        """A direct GHES /api/v3 asset URL passes through even when the host is
+        not allowlisted: passthrough issues no API request, and the download
+        helper gates the token independently, so octet-stream resolution must
+        not be withheld."""
+        called = []
+
+        @contextmanager
+        def recording_open(url, timeout=None, extra_headers=None):
+            called.append(url)
+            resp = MagicMock()
+            resp.read.return_value = b"{}"
+            yield resp
+
+        url = "https://ghes.example/api/v3/repos/o/r/releases/assets/7"
+        result = resolve_github_release_asset_api_url(
+            url, recording_open, github_hosts=("other.example",)
+        )
+        assert result == url
+        assert called == []
+
+    def test_ghes_api_base_preserves_scheme_and_port(self):
+        """The GHES API base mirrors the URL scheme and keeps a non-standard port."""
+        captured = []
+
+        @contextmanager
+        def capturing_open(url, timeout=None, extra_headers=None):
+            captured.append(url)
+            resp = MagicMock()
+            resp.read.return_value = json.dumps({"assets": []}).encode()
+            yield resp
+
+        resolve_github_release_asset_api_url(
+            "http://localhost:8000/o/r/releases/download/v1/ext.zip",
+            capturing_open,
+            github_hosts=("localhost",),
+        )
+        assert captured == ["http://localhost:8000/api/v3/repos/o/r/releases/tags/v1"]
+
+    def test_ghes_wildcard_does_not_match_bare_host(self):
+        """A '*.suffix' pattern does not match the bare host (must list it explicitly)."""
+        result = resolve_github_release_asset_api_url(
+            "https://ghes.example/o/r/releases/download/v1/ext.zip",
+            lambda *a, **kw: None,
+            github_hosts=("*.ghes.example",),
+        )
+        assert result is None
+
+    def test_public_github_url_unaffected_by_github_hosts(self):
+        """Public github.com still resolves via api.github.com even with github_hosts set."""
+        captured = []
+
+        @contextmanager
+        def capturing_open(url, timeout=None, extra_headers=None):
+            captured.append(url)
+            resp = MagicMock()
+            resp.read.return_value = json.dumps({
+                "assets": [{"name": "pack.zip",
+                            "url": "https://api.github.com/repos/org/repo/releases/assets/99"}]
+            }).encode()
+            yield resp
+
+        result = resolve_github_release_asset_api_url(
+            "https://github.com/org/repo/releases/download/v1.0/pack.zip",
+            capturing_open,
+            github_hosts=("ghes.example",),
+        )
+        assert result == "https://api.github.com/repos/org/repo/releases/assets/99"
+        assert captured == ["https://api.github.com/repos/org/repo/releases/tags/v1.0"]
