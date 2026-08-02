@@ -42,6 +42,17 @@ class WorkflowDefinition:
         self.source_path = source_path
 
         workflow = data.get("workflow", {})
+        # A present-but-non-mapping ``workflow:`` block (bare ``workflow:`` ->
+        # None, or ``workflow: <str/list>``) would crash the following
+        # ``workflow.get(...)`` calls with AttributeError, so construction fails
+        # before any validation can run. Normalize the local to {} instead: the
+        # header fields fall back to their defaults and ``validate_workflow``
+        # (which reads those parsed attributes) reports the missing
+        # ``workflow.id``/``workflow.name``. ``self.data`` is deliberately left
+        # holding the raw value, since it is what gets written back out when a
+        # definition is serialized. Mirrors the default_options guard below.
+        if not isinstance(workflow, dict):
+            workflow = {}
         self.id: str = workflow.get("id", "")
         self.name: str = workflow.get("name", "")
         self.version: str = workflow.get("version", "0.0.0")
@@ -297,7 +308,16 @@ def validate_workflow(definition: WorkflowDefinition) -> list[str]:
         errors.append("Workflow has no steps defined.")
 
     seen_ids: set[str] = set()
-    _validate_steps(definition.steps, seen_ids, errors)
+    # ``input_defs`` maps declared workflow input names to their definitions —
+    # used by ``_validate_steps`` to cross-reference gate ``verdict_input``
+    # bindings (both that the name exists and that its ``enum`` permits the
+    # reset sentinel). ``None`` means the inputs block itself is malformed
+    # (already reported above); the cross-check is then disabled so one
+    # authoring mistake does not cascade into N spurious "undeclared" errors.
+    input_defs: dict[str, Any] | None = (
+        dict(definition.inputs) if isinstance(definition.inputs, dict) else None
+    )
+    _validate_steps(definition.steps, seen_ids, errors, input_defs)
 
     return errors
 
@@ -306,8 +326,16 @@ def _validate_steps(
     steps: list[dict[str, Any]],
     seen_ids: set[str],
     errors: list[str],
+    input_defs: dict[str, Any] | None = None,
+    inside_fan_out: bool = False,
 ) -> None:
-    """Recursively validate a list of steps."""
+    """Recursively validate a list of steps.
+
+    ``input_defs`` maps declared workflow input names to their definitions (or
+    is ``None`` when the inputs block is malformed). ``inside_fan_out`` is
+    threaded through nested control-flow steps so gate verdict bindings can be
+    rejected anywhere inside a fan-out template.
+    """
     from . import STEP_REGISTRY
 
     for step_config in steps:
@@ -400,30 +428,101 @@ def _validate_steps(
                             f"unknown or not-yet-declared step id {wid!r}."
                         )
 
+        # Gate verdict_input: fan-out items cannot bind shared workflow inputs
+        # as per-item verdicts. Outside fan-out, the binding must reference a
+        # declared workflow input because ``_resolve_inputs`` drops undeclared
+        # names at both initial run and resume. Only check a non-empty string;
+        # malformed shapes are already reported by ``GateStep.validate()``.
+        if step_type == "gate":
+            verdict_input = step_config.get("verdict_input")
+            if isinstance(verdict_input, str) and verdict_input:
+                if inside_fan_out:
+                    errors.append(
+                        f"Gate step {step_id!r}: 'verdict_input' is not "
+                        "supported inside fan-out templates."
+                    )
+                elif input_defs is not None and verdict_input not in input_defs:
+                    errors.append(
+                        f"Gate step {step_id!r}: 'verdict_input' references "
+                        f"undeclared input {verdict_input!r}."
+                    )
+                elif input_defs is not None:
+                    # ``on_reject: retry`` resets the bound input to "" before
+                    # pausing, and every later resume re-resolves the persisted
+                    # inputs through ``_coerce_input``. If the input declares an
+                    # ``enum`` that omits "", that reset value is instantly
+                    # illegal: the run pauses fine, but the next resume that
+                    # supplies any input raises "value '' not in allowed
+                    # values", and no verdict can be routed through the gate
+                    # again. Require the enum to admit the sentinel so the
+                    # retry cycle the field advertises is actually reachable.
+                    verdict_def = input_defs.get(verdict_input)
+                    enum_values = (
+                        verdict_def.get("enum")
+                        if isinstance(verdict_def, dict)
+                        else None
+                    )
+                    if (
+                        step_config.get("on_reject") == "retry"
+                        and isinstance(enum_values, list)
+                        and "" not in enum_values
+                    ):
+                        errors.append(
+                            f"Gate step {step_id!r}: on_reject='retry' resets "
+                            f"verdict input {verdict_input!r} to '' when the "
+                            f"gate is rejected, but that input's 'enum' does "
+                            f"not allow ''. Add '' to the enum or use "
+                            f"on_reject='abort'/'skip'."
+                        )
+
         # Recursively validate nested steps
         for nested_key in ("then", "else", "steps"):
             nested = step_config.get(nested_key)
             if isinstance(nested, list):
-                _validate_steps(nested, seen_ids, errors)
+                _validate_steps(
+                    nested,
+                    seen_ids,
+                    errors,
+                    input_defs,
+                    inside_fan_out=inside_fan_out,
+                )
 
         # Validate switch cases
         cases = step_config.get("cases")
         if isinstance(cases, dict):
             for _case_key, case_steps in cases.items():
                 if isinstance(case_steps, list):
-                    _validate_steps(case_steps, seen_ids, errors)
+                    _validate_steps(
+                        case_steps,
+                        seen_ids,
+                        errors,
+                        input_defs,
+                        inside_fan_out=inside_fan_out,
+                    )
 
         # Validate switch default
         default = step_config.get("default")
         if isinstance(default, list):
-            _validate_steps(default, seen_ids, errors)
+            _validate_steps(
+                default,
+                seen_ids,
+                errors,
+                input_defs,
+                inside_fan_out=inside_fan_out,
+            )
 
         # Validate fan-out nested step (template — not added to seen_ids
         # since the engine generates parentId:templateId:index at runtime)
         fan_step = step_config.get("step")
         if isinstance(fan_step, dict):
             fan_errors: list[str] = []
-            _validate_steps([fan_step], set(), fan_errors)
+            _validate_steps(
+                [fan_step],
+                set(),
+                fan_errors,
+                input_defs,
+                inside_fan_out=True,
+            )
             errors.extend(fan_errors)
 
 
@@ -549,6 +648,7 @@ class RunState:
         self.created_at = datetime.now(timezone.utc).isoformat()
         self.updated_at = self.created_at
         self.log_entries: list[dict[str, Any]] = []
+        self.error: str | None = None
 
     @property
     def runs_dir(self) -> Path:
@@ -603,6 +703,7 @@ class RunState:
                 "workflow_dir": self.workflow_dir,
                 "created_at": self.created_at,
                 "updated_at": self.updated_at,
+                "error": self.error,
             }
             self._atomic_write_json(runs_dir / "state.json", state_data)
             self._atomic_write_json(runs_dir / "inputs.json", {"inputs": self.inputs})
@@ -696,6 +797,7 @@ class RunState:
         state.workflow_dir = state_data.get("workflow_dir")
         state.created_at = state_data.get("created_at", "")
         state.updated_at = state_data.get("updated_at", "")
+        state.error = state_data.get("error")
 
         inputs_path = runs_dir / "inputs.json"
         if inputs_path.exists():
@@ -890,6 +992,7 @@ class WorkflowEngine:
             return state
         except Exception as exc:
             state.status = RunStatus.FAILED
+            state.error = str(exc)
             state.append_log({"event": "workflow_failed", "error": str(exc)})
             state.save()
             raise
@@ -948,6 +1051,7 @@ class WorkflowEngine:
 
         from . import STEP_REGISTRY
 
+        state.error = None
         state.status = RunStatus.RUNNING
         state.save()
 
@@ -968,6 +1072,7 @@ class WorkflowEngine:
             return state
         except Exception as exc:
             state.status = RunStatus.FAILED
+            state.error = str(exc)
             state.append_log({"event": "resume_failed", "error": str(exc)})
             state.save()
             raise
@@ -1027,6 +1132,7 @@ class WorkflowEngine:
             step_impl = registry.get(step_type)
             if not step_impl:
                 state.status = RunStatus.FAILED
+                state.error = f"Unknown step type: {step_type!r}"
                 state.append_log(
                     {
                         "event": "step_failed",
@@ -1054,6 +1160,7 @@ class WorkflowEngine:
                 or step_config.get("input", {}),
                 "output": result.output,
                 "status": result.status.value,
+                "error": result.error,
             }
             self._record_result(context, state, step_id, step_data)
 
@@ -1079,6 +1186,7 @@ class WorkflowEngine:
                 # is for transient/expected step failures only.
                 if result.output.get("aborted"):
                     state.status = RunStatus.ABORTED
+                    state.error = result.error
                     state.append_log(
                         {
                             "event": "workflow_aborted",
@@ -1121,6 +1229,7 @@ class WorkflowEngine:
                     continue
 
                 state.status = RunStatus.FAILED
+                state.error = result.error
                 state.append_log(
                     {
                         "event": "step_failed",
@@ -1294,11 +1403,18 @@ class WorkflowEngine:
         # Sequential path — identical to the historical behavior.
         if workers <= 1:
             results: list[Any] = []
-            for item_idx, item_val in enumerate(items):
-                context.item = item_val
-                results.append(run_item(item_idx, context))
-                if state.status in halting:
-                    break
+            previous_item = context.item
+            previous_inside_fan_out = context.inside_fan_out
+            context.inside_fan_out = True
+            try:
+                for item_idx, item_val in enumerate(items):
+                    context.item = item_val
+                    results.append(run_item(item_idx, context))
+                    if state.status in halting:
+                        break
+            finally:
+                context.item = previous_item
+                context.inside_fan_out = previous_inside_fan_out
             return results
 
         # Concurrent path — bounded sliding window; results assembled in item order.
@@ -1309,7 +1425,14 @@ class WorkflowEngine:
             # Each item runs against its own context copy so context.item is not
             # clobbered across threads; the shared steps dict is written only on the
             # disjoint parentId:templateId:index key (GIL-safe on distinct keys).
-            return run_item(idx, dataclasses.replace(context, item=items[idx]))
+            return run_item(
+                idx,
+                dataclasses.replace(
+                    context,
+                    item=items[idx],
+                    inside_fan_out=True,
+                ),
+            )
 
         def item_halt_status(idx: int) -> RunStatus | None:
             # If THIS item's own execution halted the run, return the resulting run
@@ -1390,6 +1513,16 @@ class WorkflowEngine:
             # pool joined; restore the halting item's own outcome so the final run
             # status matches the sequential semantics.
             state.status = halted_status
+            # Restore the halting item's error so it matches the terminal
+            # status — a concurrent item may have overwritten state.error
+            # before the pool joined. Assign unconditionally when a record
+            # exists (even when the halting item's own error is falsy) so a
+            # third-party step returning FAILED with no message never inherits
+            # an unrelated concurrent item's error; this mirrors the sequential
+            # path, which sets state.error = result.error verbatim.
+            halt_rec = context.steps.get(item_id(halted_at))
+            if isinstance(halt_rec, dict):
+                state.error = halt_rec.get("error")
             return slots[: halted_at + 1]
         return slots[:collected]
 
@@ -1400,6 +1533,14 @@ class WorkflowEngine:
     ) -> dict[str, Any]:
         """Resolve workflow inputs against definitions and provided values."""
         resolved: dict[str, Any] = {}
+        # execute()/resume() accept UNVALIDATED definitions (load_workflow does
+        # not validate). A non-mapping ``inputs:`` block (bare ``inputs:`` ->
+        # None, or ``inputs: []``) is stored raw, so iterating ``.items()`` here
+        # would crash the run with AttributeError. Treat a non-mapping inputs
+        # block as "no inputs"; validate_workflow reports the malformed shape
+        # via its own isinstance check.
+        if not isinstance(definition.inputs, dict):
+            return {}
         for name, input_def in definition.inputs.items():
             if not isinstance(input_def, dict):
                 continue

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
+from ._invocation_style import get_invocation_prefix
 from .integration_state import integration_setting, integration_settings
 
 
@@ -64,8 +65,15 @@ def with_integration_setting(
     elif raw_options is not None:
         current.pop("parsed_options", None)
 
+    # Recompute the separator from the options actually STORED on ``current``
+    # after the update, not the raw ``parsed_options`` argument. When only
+    # ``script_type`` changes (``parsed_options`` and ``raw_options`` both
+    # None), the previously-stored ``parsed_options`` are retained above, so
+    # deriving the separator from the argument (None) would drop an
+    # options-dependent separator (e.g. Copilot ``--skills`` -> "-") back to
+    # the default ".".
     current["invoke_separator"] = integration.effective_invoke_separator(
-        parsed_options, project_root
+        current.get("parsed_options"), project_root
     )
     settings[key] = current
     return settings
@@ -92,3 +100,14 @@ def invoke_separator_for_integration(
         return integration.effective_invoke_separator(stored_parsed, project_root)
 
     return integration.effective_invoke_separator(None, project_root)
+
+
+def invoke_prefix_for_integration(
+    integration: Any,
+    key: str,
+    parsed_options: dict[str, Any] | None = None,
+    project_root: Any = None,
+) -> str:
+    """Resolve the native invocation prefix for an integration's output mode."""
+    skills_mode = integration.is_skills_mode(parsed_options, project_root)
+    return get_invocation_prefix(key, skills_mode)

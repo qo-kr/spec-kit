@@ -16,8 +16,9 @@ from urllib.parse import ParseResult, urlparse
 from urllib.request import url2pathname
 
 from ..._assets import _locate_core_pack, _repo_root
+from ..._download_security import MAX_JSON_CATALOG_BYTES, read_response_limited
 from .. import BundlerError
-from ..lib.yamlio import loads_json
+from ..lib.yamlio import load_json, loads_json
 from ..models.catalog import CatalogSource
 from ..models.manifest import ComponentRef
 
@@ -76,6 +77,8 @@ def _validate_remote_url(source_id: str, url: str) -> None:
     try:
         parsed = urlparse(url)
         hostname = parsed.hostname
+        # Accessing ``port`` performs urllib's syntax/range validation.
+        _ = parsed.port
     except ValueError:
         raise BundlerError(
             f"Catalog '{source_id}' URL is malformed: {url}"
@@ -117,7 +120,15 @@ def make_catalog_fetcher(*, allow_network: bool = True):
 
     def fetch(source: CatalogSource) -> dict:
         url = source.url
-        parsed = urlparse(url)
+        try:
+            parsed = urlparse(url)
+            # Keep malformed authorities and ports inside the BundlerError
+            # contract even when a config file was edited by hand.
+            _ = parsed.port
+        except ValueError:
+            raise BundlerError(
+                f"Catalog {source.id!r} URL is malformed: {url!r}"
+            ) from None
         scheme = parsed.scheme.lower()
 
         if scheme == "builtin":
@@ -134,13 +145,13 @@ def make_catalog_fetcher(*, allow_network: bool = True):
             path = _file_url_to_path(parsed)
             if not path.exists():
                 raise BundlerError(f"Catalog file not found: {path}")
-            return loads_json(path.read_text(encoding="utf-8"), origin=str(path))
+            return load_json(path)
 
         if scheme == "" or _is_windows_drive_path(url):
             path = Path(url)
             if not path.exists():
                 raise BundlerError(f"Catalog file not found: {path}")
-            return loads_json(path.read_text(encoding="utf-8"), origin=str(path))
+            return load_json(path)
 
         if scheme in ("http", "https"):
             if not allow_network:
@@ -180,7 +191,12 @@ def _http_get_json(source_id: str, url: str) -> dict:
         ) as response:
             final_url = response.geturl()
             _validate_remote_url(source_id, final_url)
-            raw = response.read().decode("utf-8")
+            raw = read_response_limited(
+                response,
+                max_bytes=MAX_JSON_CATALOG_BYTES,
+                error_type=BundlerError,
+                label=f"bundle catalog '{source_id}'",
+            ).decode("utf-8")
     except BundlerError:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -210,6 +226,10 @@ class DefaultPrimitiveInstaller:
     def install(self, project_root: Path, component: ComponentRef) -> None:
         manager = self._manager_for(component, project_root)
         manager.install(component)
+
+    def refresh(self, project_root: Path, component: ComponentRef) -> None:
+        manager = self._manager_for(component, project_root)
+        manager.refresh(component)
 
     def remove(self, project_root: Path, component: ComponentRef) -> None:
         manager = self._manager_for(component, project_root)

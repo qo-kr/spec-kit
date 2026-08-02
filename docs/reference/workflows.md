@@ -39,6 +39,21 @@ specify workflow run my-pipeline.yml --json
 
 `workflow_id` is the `workflow.id` declared inside the YAML, not the file name. The object is printed exactly as shown — pretty-printed with two-space indentation, on plain stdout with no Rich markup — so it always parses. While the workflow runs under `--json`, any progress a step would print (for example a gate prompt, or output from a prompt step's CLI subprocess) is redirected to stderr, so stdout carries only the JSON object. Read the object from stdout; leave stderr attached to the terminal or capture it separately.
 
+For `failed` and `aborted` runs, the payload includes an `error` field carrying the terminal step's error message:
+
+```json
+{
+  "run_id": "662bf791",
+  "workflow_id": "build-and-review",
+  "status": "failed",
+  "current_step_id": "boom",
+  "current_step_index": 0,
+  "error": "Command exited with code 3"
+}
+```
+
+`completed` and `paused` runs omit the `error` field. The error is persisted in the run's `state.json`, so `specify workflow status <run_id> --json` surfaces the same message after the fact.
+
 > **Note:** Most workflow commands require a project already initialized with `specify init`. The exception is `specify workflow run <local-file.{yml,yaml}>`, which can run outside a project; in that case, run state is stored under the current directory's `.specify/workflows/runs/<run_id>/`.
 
 ## Resume a Workflow
@@ -88,10 +103,17 @@ specify workflow add <source>
 
 | Option          | Description                                            |
 | --------------- | ------------------------------------------------------ |
-| `--dev`         | Install from a local workflow YAML file or directory   |
+| `--dev`         | Install from a local YAML file, package directory, or archive |
 | `--from <url>`  | Install from a custom URL (`<source>` names the expected workflow ID) |
 
-Installs a workflow from the catalog, a URL (HTTPS required), a local YAML file, or a local directory containing `workflow.yml`.
+Installs a workflow from the catalog, an HTTPS URL, a local YAML file, a
+directory containing `workflow.yml`, or a `.zip`, `.tar.gz`, or `.tgz`
+archive. Archives may contain `workflow.yml` at the root or inside one
+top-level directory.
+
+Directory and archive installs preserve the complete workflow package,
+including scripts and other companion files. ZIP, `.tar.gz`, and `.tgz`
+archives follow the same validation and installation behavior.
 
 ## Workflow Overlays
 
@@ -266,7 +288,9 @@ Lower priority values have higher precedence. Change this overlay to `priority: 
 
 ### Interaction with Bundles and Updates
 
-`specify workflow add <local-directory>` installs `workflow.yml` from the local directory into `.specify/workflows/<id>/`.
+`specify workflow add <local-directory>` installs the complete local workflow
+package into `.specify/workflows/<id>/`. Archive installs preserve the same
+package contents.
 
 When an installed workflow is refreshed or reinstalled, project overlays in `.specify/workflows/overlays/<id>/` are preserved because they live outside the installed workflow directory.
 
@@ -502,6 +526,32 @@ args: "{{ inputs.spec }}"
 message: "{{ status | default('pending') }}"
 ```
 
+### Interpolation and shell safety
+
+Expressions are resolved by **plain string substitution** — the value of `{{ ... }}` is spliced into the surrounding text exactly as-is, with no quoting or escaping added. That is convenient for building `args` and `message` strings, but it has an important consequence for `shell` steps: a `run` field is handed to the system shell (`/bin/sh -c` on POSIX), so any interpolated value is interpreted as **shell syntax**, not just data.
+
+If an interpolated value can contain characters like `;`, `|`, `&`, `$( )`, backticks, or quotes, it can change or extend the command that actually runs. This matters most when the value is not fully under the workflow author's control:
+
+- **Workflow `inputs.*`** — supplied by whoever runs the workflow.
+- **A prior step's output**, e.g. `{{ steps.plan.output.stdout }}` — for a `prompt` step this is **text produced by the AI agent**, which can in turn be influenced by files, tickets, or web content the agent read. Treat agent output as untrusted when it flows into a `shell` step.
+
+There is **no shell-escaping filter** in the expression language and **no sandbox** around a `shell` step, so none of the practices below can be treated as a guarantee that a hostile value is neutralised. The only reliable control is to constrain what an interpolated value *can* be, and to keep values you cannot constrain out of `run` fields entirely. Scrutinise every `run` field that interpolates a value you do not control, and at minimum:
+
+- **Constrain the value at the source with `enum`/an allowlist.** When `inputs.*` feeds a `run` field, restrict it to a fixed set of known-safe values so a caller cannot supply arbitrary shell text at all. This is the strongest control the engine offers — prefer it over any downstream mitigation.
+
+  ```yaml
+  inputs:
+    target:
+      type: string
+      enum: [staging, production]   # caller cannot inject arbitrary text
+  ```
+
+- **Keep unconstrained values out of `run`.** If a value cannot be constrained to an allowlist — most agent/`prompt` output — do not interpolate it into a `run` field. Branch on it with `if`/`switch` against fixed conditions, or act on it in a `command`/`prompt` step rather than a shell command built from it.
+- **Quoting is not a security boundary.** Surrounding a substitution with quotes (`'{{ inputs.x }}'`) helps the shell treat a *trusted* value as a single argument and avoids word-splitting on spaces, but a value that itself contains the matching quote character can still break out and inject shell syntax. Quote for correctness on constrained values; never rely on quoting to make an *unconstrained* substitution safe.
+- **Gates do not inspect the next step, and `message` is printed verbatim.** A `gate` step renders only its own `message`/`show_file` — it does not display, resolve, or sanitise the command that follows it, and approval never neutralises an injectable interpolation. Do **not** interpolate raw untrusted data into `message`: it is printed as-is with no control-character stripping, so agent or caller output could inject terminal/ANSI escapes that alter or hide the approval prompt. Keep `message` to trusted, constrained text, and surface untrusted material for review via `show_file` instead — its path and contents are control/ANSI-stripped before display.
+
+A `shell` step is an arbitrary-command primitive by design; these practices reduce exposure and keep *which* command runs under the author's control, but they do not eliminate the risk of interpolating values you do not fully control.
+
 ## Shell Step Environment Variables
 
 Shell steps automatically receive the following environment variables:
@@ -527,6 +577,64 @@ Each workflow run persists its state at `.specify/workflows/runs/<run_id>/`:
 - `log.jsonl` — step-by-step execution log
 
 This enables `specify workflow resume` to continue from the exact step where a run was paused (e.g., at a gate) or failed.
+
+### Gate Verdict Inputs
+
+`verdict_input` binds a gate's verdict to a named workflow input. The input must be declared in the workflow's `inputs` block; `specify workflow validate` reports an undeclared reference.
+
+`verdict_input` is not supported inside a `fan-out` template. Fan-out items
+share workflow inputs, while workflow state can represent only one paused
+gate. Place a gate before the fan-out to approve the whole batch, or after a
+fan-in to review the aggregated results.
+
+**Input value semantics:**
+
+| Value | Behavior |
+|---|---|
+| Non-empty string, matches an option (case-insensitive) | Gate auto-decides; `output.choice` is set to the configured option spelling |
+| Non-empty string, no match | Gate fails immediately |
+| Non-string | Gate fails immediately |
+| Missing or empty | Gate prompts on a TTY; pauses otherwise |
+
+**Default value semantics:** A non-empty `default` is consumed as a verdict on the first run — matching an option auto-decides the gate, not matching fails it immediately.
+
+```yaml
+inputs:
+  spec_verdict:
+    type: string
+    default: ""
+steps:
+  - id: review-spec
+    type: gate
+    message: "Approve the specification?"
+    options: [approve, reject]
+    on_reject: retry
+    verdict_input: spec_verdict
+```
+
+Supply a verdict when resuming:
+
+```bash
+specify workflow resume <run_id> --input spec_verdict=approve
+```
+
+For `on_reject: retry`, a bound reject verdict is consumed before the gate
+pauses: the named stored input is reset to `""`. A later resume therefore
+prompts or pauses again until another verdict is supplied. Approve, abort, and
+skip outcomes leave the input unchanged.
+
+Because of that reset, a verdict input used with `on_reject: retry` must accept
+`""`. If it declares an `enum`, include the empty string — otherwise the reset
+value violates the input's own `enum` and the run can no longer be resumed with
+any input. `specify workflow add` reports this as a validation error.
+
+```yaml
+inputs:
+  spec_verdict:
+    type: string
+    enum: ["", approve, reject]
+    default: ""
+```
 
 ## FAQ
 
