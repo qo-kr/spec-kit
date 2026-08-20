@@ -2,6 +2,183 @@
 
 <!-- insert new changelog below this comment -->
 
+## [0.16.5] - 2026-08-19
+
+### Changed
+
+- fix(powershell): stop Out-Null swallowing setup-tasks AVAILABLE_DOCS lines (#4188)
+- fix: provision Spec Kit CLI and assess extension in feature-assess host setup steps (#4195)
+- fix: provision uv and Python for feature-assess workflow (#4193)
+- feat: add feature-assess agentic workflow that installs and runs Spec Kit (#4186)
+- [extension] Update Superpowers Implementation Bridge to v1.2.0 (#4183)
+- fix(init): stop specify init hanging on arrow-key pickers in agent harnesses (#4178)
+- [extension] Add DUBSAR Memory extension to community catalog (#4170)
+- Add AgentPay x402 extension to community catalog (#4174)
+- Update Keel Discovery extension to v0.2.0 (#4172)
+- fix: confine event hook script paths to the project tree (#4133)
+- Clarify extension catalog trust model in docs, help, and messaging (#4177)
+- Add pay-x402 community extension with correct catalog-addition timestamps (#4175)
+- Add ASCII Diagram Renderer extension to community catalog (#4173)
+- Update Intake Review Governance preset to v0.2.1 (#4169)
+- test(presets): normalize whitespace in resolve output assertion to prevent terminal line-wrap failures (#4166)
+- fix(workflows): clean up download temp file on interrupt or typer.Exit (#4134)
+- fix(workflows): report a falsy non-mapping overlay manifest as a shape error (#3884)
+- fix(bundler): resolve built-in step types when checking bundle component references (#3885)
+- Add SpecAssay bundle to community catalog (#4125)
+- chore: release 0.16.4, begin 0.16.5.dev0 development (#4124)
+
+## [0.16.4] - 2026-08-14
+
+### Changed
+
+- Add SpecAssay preset to community catalog (#4123)
+- Update Intake Authoring Governance preset to v0.3.1 (#4121)
+- Update Superspec extension to v1.0.2 (#4120)
+- fix(taskstoissues): widen task-ID regex to match IDs longer than 3 digits (#4101)
+- Add Architecture Governance extension to community catalog (#4122)
+- fix(workflows): validate non-string step types (#4111)
+- Harden community submission workflow output allowlists (#4103)
+- chore(deps): bump github/codeql-action (init + analyze) from 4.37.5 to 4.37.6 (#4114)
+- Add SpecAssay Check extension to community catalog (#4113)
+- fix(integrations): dispatch goose commands via `goose run` (#2416) (#3781)
+- fix(powershell): stop Out-Null swallowing the AVAILABLE_DOCS status lines (#3891)
+- fix: remove TOCTOU race in RunState.load (#3839)
+- fix: decode the zipped manifest as UTF-8 before parsing (#3958)
+- Update Agent Parity Governance preset to v0.4.2 (#4110)
+- fix: log progress tracker refresh errors instead of silently swallowing (#3975)
+- [extension] Add SpecJudge extension to community catalog (#4079)
+- fix(bundler): read the authoritative `default_integration` field, not only its legacy aliases (#3880)
+- fix(auth): treat exact host patterns literally (#4108)
+- feat: add Mistral Vibe integration with Claude parity (#4075)
+- [extension] Add spec-kit-atlas extension to community catalog (#4105)
+- chore: release 0.16.3, begin 0.16.4.dev0 development (#4107)
+
+## [0.16.3] - 2026-08-13
+
+### Changed
+
+- fix: narrow bare except Exception in VS Code settings merge (#3844)
+- feat(presets): list presets in resolution/precedence order (#4086) (#4104)
+- Fix: scaffold self-contained namespaced preset commands (#4076) (#4082)
+- Update Cross-Platform Governance preset to v0.2.2 (#4080)
+- fix(bundler): treat a blank active integration as indeterminate in FR-019 (#3886)
+- Integrate Junie with dot-to-hyphen behavior and command formatting  (#4073)
+- Update A11Y Governance preset to v0.4.3 (#4074)
+- Fix Alquimia argument hints after folded descriptions (#4063)
+- fix: use bounded read for bundle download HTTP responses (#3764)
+- Update iSAQB Architecture Governance preset to v0.2.2 (#4056)
+- fix(claude): make argument-hint injection fold-aware for long descriptions (#4045)
+- Add SpecKit Grill Me extension to community catalog (#4052)
+- Update Architecture Governance preset to v0.5.2 (#4050)
+- Remove auto-assign from catalog submission workflow (#4054)
+- docs: clarify example spec guidance (#4048)
+- Clarify custom checklist ownership and lifecycle (#4028)
+- Update Archive Extension to v1.2.2 (#4053)
+- Update Security Governance preset to v0.6.2 (#4040)
+- docs: clarify maintainer applies submission label during triage (#4041)
+- chore: release 0.16.2, begin 0.16.3.dev0 development (#4038)
+
+## [0.16.2] - 2026-08-10
+
+### Changed
+
+- Add Command Code integration to spec-kit (#4019)
+- fix(workflows): strip a resolved condition before the true/false check (#3883)
+- fix(workflows): guard a non-string overlay edit 'operation' (#3881)
+- fix: bound response read in integration catalog fetch (#3818)
+- Fix bug-test Python dependency provisioning (#4030)
+- fix(bundle): escape Rich markup in bundle CLI error and status output (#4023)
+- fix(presets): skip an unreadable restore source in `preset remove` (#4020)
+- Add Keel Discovery extension to community catalog (#4035)
+- fix: show error details in preset catalog config read failure (#3840)
+- Update Reconcile Extension to v1.1.0 (#4034)
+- Add Model Routing Governance preset to community catalog (#4033)
+- fix: use missing_ok=True in integration JSON removal (#3846)
+- fix: use missing_ok=True in extension cache clear (#3845)
+- fix(extensions): reject duplicate provides.templates/scripts names (#4016)
+- feat(presets): resolve constitution templates at command time (#3984)
+- [bug-fix] Fix preset-wrap-drops-argument-hint: inherit argument-hint from core template (#3996)
+- docs: document installing specify-cli from a custom package index (#4032)
+- feat(extensions): accept provides.templates and provides.scripts in manifest (#4012)
+- fix(presets): treat an unreadable core template as missing (#3961)
+- chore: release 0.16.1, begin 0.16.2.dev0 development (#4014)
+
+## [0.16.1] - 2026-08-07
+
+### Changed
+
+- fix(integrations): wrap a non-UTF-8 catalog response (#4011)
+- fix(events): skip an unreadable command template (#3956)
+- fix(bundle): wrap malformed YAML in a local .zip bundle manifest (#4013)
+- chore(deps): bump github/codeql-action/analyze from 4.37.3 to 4.37.5 (#4005)
+- chore(deps): bump DavidAnson/markdownlint-cli2-action (#4006)
+- fix(agent-context): recurse for nested plans in Python mtime fallback (#3757)
+- fix: add utf-8 encoding to extension and preset registry file I/O (#3834)
+- fix(init): escape user-supplied values in `specify init` output (#3787)
+- fix: bound response read in integration catalog fetch (#3812)
+- fix: use missing_ok for temp file cleanup to avoid masking errors (#3803)
+- fix(workflows): handle an unreadable run state in `workflow status` (#3999)
+- feat(init): scaffold managed .specify/.gitignore (#4000)
+- fix(scripts): stop check-prerequisites text mode crashing on a legacy stdout code page (#3890)
+- fix(presets): return None for an unreadable layer in resolve_content (#3959)
+- fix(extensions): start fresh on a non-UTF-8 extension registry (#3998)
+- Fix init-force-preset-desync: reapply presets/extensions on init --here --force (#3995)
+- fix(skills): apply the line-anchored delimiter scan to hermes and kimi (#3739)
+- fix(archives): wrap the bare EOFError a truncated tar.gz raises (#3938)
+- test(integrations): guard multiline/control-char SKILL.md frontmatter escaping (#3392)
+- fix(scripts): stop setup-tasks text mode crashing on a legacy code page (#3892)
+- chore: release 0.16.0, begin 0.16.1.dev0 development (#3992)
+
+## [0.16.0] - 2026-08-05
+
+### Changed
+
+- fix: keep long frontmatter values on a single line (#3989)
+- fix: skip corrupted run state files in list_runs (#3817)
+- fix: skip corrupted run state files in list_runs (#3814)
+- Add July 2026 newsletter (#3987)
+- fix(presets): start fresh on a non-UTF-8 preset registry (#3955)
+- docs: clarify agent PR review prioritization (#3985)
+- fix(events): preserve a non-UTF-8 config.toml on hook install/teardown (#3963)
+- fix(extensions): treat an unreadable staged backup as a conflict (#3962)
+- fix(manifests): reject non-string requires.speckit_version (#3980)
+- fix(extensions): reject reinstall when a kept config cannot be read (#3960)
+- [extension] Update Charter extension to v0.5.1 (#3983)
+- fix(events): return None for an unparseable script command (#3957)
+- feat(events): context injection for opencode and JSON-envelope agent hooks (#3934)
+- Add TDD Extension to community catalog (#3982)
+- Update Archive Extension to v1.1.0 (#3981)
+- feat(copilot): default integration to skills (#3976)
+- fix(events): ignore non-UTF-8 event overrides (#3897)
+- fix: cap stdin read at 1 MiB to prevent DoS (#3857)
+- fix(workflows): reject mismatched run state IDs (#3899)
+- chore: release 0.15.2, begin 0.15.3.dev0 development (#3953)
+
+## [0.15.2] - 2026-08-03
+
+### Changed
+
+- fix(presets): restore core skills instead of deleting them on preset remove (#3929)
+- fix(manifests): reject non-string metadata instead of crashing on it (#3943)
+- fix: narrow bare except Exception in invoke separator resolution (#3856)
+- fix(workflows): keep the init step's documented ignore_agent_tools default on an explicit null (#3889)
+- fix(kimi): preserve non-UTF-8 user skills (#3895)
+- fix(presets): tolerate non-UTF-8 legacy commands (#3896)
+- feat: allow overriding default init integration via SPECKIT_INTEGRATION_DEFAULT (#3952)
+- Add adrkit extension to community catalog (#3947)
+- feat(extensions): scaffold config templates on extension add/enable (#2000)
+- fix(events): skip non-UTF-8 extension manifests (#3900)
+- fix(workflows): fail a gate whose on_reject is not abort/skip/retry (#3888)
+- fix(presets): validate required manifest mappings (#3898)
+- fix: eliminate TOCTOU race in zip packaging (#3855)
+- fix(workflows): fail a fan-in step whose output is not a mapping (#3887)
+- fix(workflows): refetch non-UTF-8 catalog caches (#3901)
+- fix(bundler): wrap local catalog decode failures (#3902)
+- Add `--extension` flag to `specify init` for opting into extensions at init time (#3914)
+- fix: bound response reads in extension catalog and download (#3775)
+- fix(workflows): reject a retry gate whose verdict enum forbids the reset value (#3912)
+- chore: release 0.15.1, begin 0.15.2.dev0 development (#3913)
+
 ## [0.15.1] - 2026-07-31
 
 ### Changed

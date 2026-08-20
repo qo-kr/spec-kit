@@ -3,10 +3,9 @@
 This guide will help you get started with Spec-Driven Development using Spec Kit. Throughout, we illustrate each step with a running example: **Taskify**, a small team productivity platform.
 
 > [!NOTE]
-> Automation scripts are provided as Bash (`.sh`), PowerShell (`.ps1`), and Python (`.py`) variants. Interactive `specify init` prompts you to choose one; non-interactive runs default to a shell variant for your OS. Pass `--script sh|ps|py` to select explicitly.
+> Automation scripts are provided as Bash (`.sh`), PowerShell (`.ps1`), and Python (`.py`) variants. Interactive `specify init` prompts you to choose one; non-interactive runs (no TTY, or `--non-interactive`) default to a shell variant for your OS. Pass `--script sh|ps|py` to select explicitly.
 
-> [!NOTE]
-> Commands are shown here in `/speckit.*` form, but the exact invocation depends on your agent. Some skills-based agents use `$speckit-*` (e.g. Codex, ZCode) or `/skill:speckit-*` (e.g. Kimi). Use whichever form your agent exposes — the steps are otherwise identical.
+Commands are shown here in `/speckit.*` form, but the exact invocation depends on your agent. Some skills-based agents use `$speckit-*` (e.g. Codex, ZCode) or `/skill:speckit-*` (e.g. Kimi). Use whichever form your agent exposes — the steps are otherwise identical.
 
 ## Recommended Process
 
@@ -44,7 +43,7 @@ uv tool install specify-cli
 specify init taskify   # or: specify init .   to use the current directory
 ```
 
-`init` lets you pick your coding agent interactively, or pass it explicitly with `--integration` (e.g. `--integration copilot`).
+`init` lets you pick your coding agent interactively, or pass it explicitly with `--integration` (e.g. `--integration copilot`). For CI and AI agent harnesses, add `--non-interactive` so unspecified choices use documented defaults instead of hanging on an arrow-key picker.
 
 > [!NOTE]
 > Prefer `pipx`, one-time `uvx` runs, a pinned release, or an offline/air-gapped setup? See the [Installation Guide](installation.md) for all supported methods.
@@ -83,7 +82,7 @@ Generates the design artifacts from the spec. This is where implementation detai
 
 ### Step 5: `/speckit.checklist` — validate the spec
 
-Generates a quality checklist — "unit tests for your requirements" — to confirm the spec is complete, clear, and consistent before you break the work down.
+Generates a custom quality checklist — "unit tests for your requirements" — to confirm the spec is complete, clear, and consistent before you break the work down. These custom checklists are reviewer-owned requirements-quality review artifacts: mark an item `[x]` only when the reviewer determines that requirement-quality criterion is satisfied. Checked custom items do not mean implementation work is complete.
 
 ```text
 /speckit.checklist
@@ -107,7 +106,7 @@ Reports conflicts, gaps, and ambiguities across `spec.md`, `plan.md`, and `tasks
 
 ### Step 8: `/speckit.implement` — build it
 
-Executes the tasks in `tasks.md` in dependency order. Run it once to build everything, or scope it to one phase at a time for large features.
+Executes the tasks in `tasks.md` in dependency order. Before implementation, it reads checklist checkbox state as a gate and asks before proceeding if any checklist items are unchecked; it does not change any checklist files or markers. The built-in `checklists/requirements.md` checklist is maintained by `/speckit.specify` and `/speckit.clarify`, while custom checklists remain reviewer-owned. Run it once to build everything, or scope it to one phase at a time for large features.
 
 ```text
 /speckit.implement
@@ -136,5 +135,6 @@ Checks the codebase against the spec, plan, and tasks. If it finds gaps, it appe
 
 - See the [Agentic SDD](reference/agentic-sdd.md) reference for full detail on every command
 - Read the [complete methodology](https://github.com/github/spec-kit/blob/main/spec-driven.md) for in-depth guidance
-- Check out [more examples](https://github.com/github/spec-kit/tree/main/templates) in the repository
+- Compare the [core templates](https://github.com/github/spec-kit/tree/main/templates) with
+  [community walkthroughs](community/walkthroughs.md) to see how Spec-Driven Development is used in real projects
 - Explore the [source code on GitHub](https://github.com/github/spec-kit)

@@ -207,7 +207,7 @@ class IntegrationCatalog(CatalogStackBase):
                         max_bytes=MAX_JSON_METADATA_BYTES,
                         error_type=IntegrationCatalogError,
                         label=f"catalog from {entry.url}",
-                    )
+                    ).decode("utf-8")
                 )
 
             shape_error = _catalog_shape_error(catalog_data)
@@ -236,6 +236,15 @@ class IntegrationCatalog(CatalogStackBase):
         except urllib.error.URLError as exc:
             raise IntegrationCatalogError(
                 f"Failed to fetch catalog from {entry.url}: {exc}"
+            )
+        except UnicodeDecodeError as exc:
+            # A non-UTF-8 response body fails at .decode() before json.loads()
+            # ever runs, so JSONDecodeError below does not cover it (the two are
+            # sibling ValueError subclasses, not parent/child). Without this the
+            # raw UnicodeDecodeError escapes _get_merged_integrations()'s
+            # "warn and skip this catalog" handler and kills the whole command.
+            raise IntegrationCatalogError(
+                f"Catalog from {entry.url} is not valid UTF-8: {exc}"
             )
         except json.JSONDecodeError as exc:
             raise IntegrationCatalogError(
@@ -665,16 +674,37 @@ class IntegrationDescriptor:
     @staticmethod
     def _load(path: Path) -> dict:
         try:
-            with open(path, "r", encoding="utf-8") as fh:
-                return yaml.safe_load(fh) or {}
-        except yaml.YAMLError as exc:
-            raise IntegrationDescriptorError(f"Invalid YAML in {path}: {exc}")
+            text = path.read_text(encoding="utf-8")
         except FileNotFoundError:
             raise IntegrationDescriptorError(f"Descriptor not found: {path}")
         except (OSError, UnicodeError) as exc:
             raise IntegrationDescriptorError(
                 f"Unable to read descriptor {path}: {exc}"
             )
+        try:
+            # ``safe_load`` returns None for BOTH an empty document and an
+            # explicit null scalar (``null``, ``~``, ``Null``, ``NULL``), so it
+            # cannot tell them apart on its own. ``compose`` yields no node
+            # only for a genuinely empty document.
+            node = yaml.compose(text)
+            data = yaml.safe_load(text)
+            is_empty_document = node is None or (
+                data is None
+                and isinstance(node, yaml.nodes.ScalarNode)
+                and node.value == ""
+                and node.start_mark.index == node.end_mark.index
+            )
+        except yaml.YAMLError as exc:
+            raise IntegrationDescriptorError(f"Invalid YAML in {path}: {exc}")
+        # Only a genuinely EMPTY document becomes an empty mapping, so its
+        # missing-field errors are reported. Every non-mapping document --
+        # including an explicit ``null``/``~`` and the falsy shapes ``[]``,
+        # ``false``, ``0``, ``''`` that a plain ``or {}`` would mask -- must
+        # reach ``_validate`` unchanged so it reports the wrong descriptor
+        # shape, like the truthy twins (``- a``, ``hello``) already do.
+        if is_empty_document:
+            data = {}
+        return data
 
     # -- Validation -------------------------------------------------------
 

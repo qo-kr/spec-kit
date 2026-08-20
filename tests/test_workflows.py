@@ -786,6 +786,39 @@ class TestExpressions:
         assert evaluate_condition("{{ inputs.ready }}", ctx) is True
         assert evaluate_condition("{{ inputs.missing }}", ctx) is False
 
+    def test_condition_strips_captured_command_output(self):
+        """A condition resolving to captured stdout must honour "false".
+
+        A ``shell`` step stores ``proc.stdout`` verbatim, so ``run: echo false``
+        resolves to ``"false\\n"``. Without stripping, the trailing newline
+        matched neither the "false" nor the "true" branch and fell through to
+        ``bool("false\\n")`` -> True, so an ``if`` step took its ``then`` branch
+        on a step that printed "false". There is no ``trim`` filter, so a
+        workflow author cannot strip it themselves.
+        """
+        from specify_cli.workflows.expressions import evaluate_condition
+        from specify_cli.workflows.base import StepContext
+
+        ctx = StepContext(steps={"check": {"output": {"stdout": "false\n"}}})
+        assert evaluate_condition("{{ steps.check.output.stdout }}", ctx) is False
+
+        for raw in ("false\n", "false\r\n", " false", "false ", "FALSE\n"):
+            assert evaluate_condition(raw, StepContext()) is False, raw
+        for raw in ("true\n", " true ", "TRUE\r\n"):
+            assert evaluate_condition(raw, StepContext()) is True, raw
+
+    def test_condition_whitespace_only_string_stays_truthy(self):
+        """Stripping must not turn a whitespace-only string into False.
+
+        Only the "false"/"true" special case is stripped; everything else still
+        falls through to ``bool(result)`` on the raw string.
+        """
+        from specify_cli.workflows.expressions import evaluate_condition
+        from specify_cli.workflows.base import StepContext
+
+        assert evaluate_condition("   ", StepContext()) is True
+        assert evaluate_condition("falsey", StepContext()) is True
+
     def test_non_string_passthrough(self):
         from specify_cli.workflows.expressions import evaluate_expression
         from specify_cli.workflows.base import StepContext
@@ -2176,6 +2209,59 @@ class TestInitStep:
         assert "--ignore-agent-tools" in argv
         assert (tmp_path / ".specify").is_dir()
 
+    def test_explicit_null_ignore_agent_tools_keeps_documented_default(
+        self, tmp_path
+    ):
+        """A bare ``ignore_agent_tools:`` must keep the documented default.
+
+        The class docstring says "Because workflows run unattended, the step
+        defaults to ``--ignore-agent-tools``" and the field docs say "defaults to
+        ``true``". But ``config.get(key, True)`` applies the default only when the
+        key is ABSENT — a bare ``ignore_agent_tools:`` in YAML parses to None,
+        which ``_resolve_bool`` turned into False, dropping the flag and
+        re-enabling the agent-CLI presence check for an unattended run.
+        """
+        from specify_cli.workflows.steps.init import InitStep
+        from specify_cli.workflows.base import StepContext, StepStatus
+
+        step = InitStep()
+        ctx = StepContext(
+            project_root=str(tmp_path), default_integration="copilot"
+        )
+        result = step.execute(
+            {
+                "id": "bootstrap",
+                "here": True,
+                "script": "sh",
+                "ignore_agent_tools": None,
+            },
+            ctx,
+        )
+
+        assert result.status == StepStatus.COMPLETED
+        assert "--ignore-agent-tools" in result.output["argv"]
+
+    def test_explicit_false_ignore_agent_tools_is_honoured(self, tmp_path):
+        """An explicit ``false`` must still opt in to the agent-CLI check."""
+        from specify_cli.workflows.steps.init import InitStep
+        from specify_cli.workflows.base import StepContext
+
+        step = InitStep()
+        ctx = StepContext(
+            project_root=str(tmp_path), default_integration="copilot"
+        )
+        result = step.execute(
+            {
+                "id": "bootstrap",
+                "here": True,
+                "script": "sh",
+                "ignore_agent_tools": False,
+            },
+            ctx,
+        )
+
+        assert "--ignore-agent-tools" not in result.output["argv"]
+
     def test_default_integration_falls_back_to_workflow_default(self, tmp_path):
         from specify_cli.workflows.steps.init import InitStep
         from specify_cli.workflows.base import StepContext, StepStatus
@@ -2189,6 +2275,24 @@ class TestInitStep:
         )
         assert result.status == StepStatus.COMPLETED
         assert result.output["integration"] == "copilot"
+
+    def test_default_integration_honors_env_var(self, tmp_path, monkeypatch):
+        # With no step-level and no workflow-level default, the resolved
+        # SPECKIT_INTEGRATION_DEFAULT value must drive both output.integration
+        # and the argv passed to init (guards against reverting to the constant).
+        from specify_cli.workflows.steps.init import InitStep
+        from specify_cli.workflows.base import StepContext, StepStatus
+
+        monkeypatch.setenv("SPECKIT_INTEGRATION_DEFAULT", "gemini")
+        step = InitStep()
+        ctx = StepContext(project_root=str(tmp_path))
+        result = step.execute(
+            {"id": "bootstrap", "here": True, "script": "sh"}, ctx
+        )
+        assert result.status == StepStatus.COMPLETED
+        assert result.output["integration"] == "gemini"
+        argv = result.output["argv"]
+        assert "--integration" in argv and "gemini" in argv
 
     def test_project_name_creates_subdirectory(self, tmp_path):
         from specify_cli.workflows.steps.init import InitStep
@@ -4416,6 +4520,94 @@ steps:
         errors = validate_workflow(definition)
         assert errors == []
 
+    @pytest.mark.parametrize(
+        "field, bad_value",
+        [
+            ("integration", ["claude"]),
+            ("integration", {"name": "claude"}),
+            ("integration", False),
+            ("model", ["gpt-5"]),
+            ("model", {"name": "gpt-5"}),
+            ("model", 0),
+            ("options", ["max_tokens"]),
+            ("options", "max_tokens"),
+            ("options", False),
+        ],
+    )
+    def test_rejects_invalid_workflow_dispatch_defaults(self, field, bad_value):
+        """Top-level dispatch defaults must retain their invalid shape for
+        validation instead of being passed to a step or normalized to ``{}``.
+        """
+        from specify_cli.workflows.engine import WorkflowDefinition, validate_workflow
+
+        definition = WorkflowDefinition(
+            {
+                "workflow": {
+                    "id": "test",
+                    "name": "Test",
+                    "version": "1.0.0",
+                    field: bad_value,
+                },
+                "steps": [{"id": "step-one", "command": "speckit.specify"}],
+            }
+        )
+
+        errors = validate_workflow(definition)
+
+        assert any(f"workflow.{field}" in error for error in errors), errors
+        assert any(type(bad_value).__name__ in error for error in errors), errors
+        if field == "options":
+            assert definition.default_options == bad_value
+
+    def test_preserves_valid_workflow_dispatch_defaults(self):
+        """String and mapping defaults stay available unchanged to steps."""
+        from specify_cli.workflows.engine import WorkflowDefinition, validate_workflow
+
+        defaults = {
+            "integration": "claude",
+            "model": "gpt-5",
+            "options": {"max_tokens": 8000},
+        }
+        definition = WorkflowDefinition(
+            {
+                "workflow": {
+                    "id": "test",
+                    "name": "Test",
+                    "version": "1.0.0",
+                    **defaults,
+                },
+                "steps": [{"id": "step-one", "command": "speckit.specify"}],
+            }
+        )
+
+        assert definition.default_integration == defaults["integration"]
+        assert definition.default_model == defaults["model"]
+        assert definition.default_options == defaults["options"]
+        assert validate_workflow(definition) == []
+
+    def test_accepts_null_workflow_dispatch_defaults(self):
+        """Null integration/model inherit at runtime and null options stays {}."""
+        from specify_cli.workflows.engine import WorkflowDefinition, validate_workflow
+
+        definition = WorkflowDefinition(
+            {
+                "workflow": {
+                    "id": "test",
+                    "name": "Test",
+                    "version": "1.0.0",
+                    "integration": None,
+                    "model": None,
+                    "options": None,
+                },
+                "steps": [{"id": "step-one", "command": "speckit.specify"}],
+            }
+        )
+
+        assert definition.default_integration is None
+        assert definition.default_model is None
+        assert definition.default_options == {}
+        assert validate_workflow(definition) == []
+
     def test_no_steps(self):
         from specify_cli.workflows.engine import WorkflowDefinition, validate_workflow
 
@@ -4460,6 +4652,29 @@ steps:
 """)
         errors = validate_workflow(definition)
         assert any("invalid type" in e.lower() for e in errors)
+
+    @pytest.mark.parametrize("step_type", [["shell"], {"name": "shell"}])
+    def test_non_string_step_type_reports_error(self, step_type):
+        """Unhashable YAML values must not crash registry membership checks."""
+        from specify_cli.workflows.engine import WorkflowDefinition, validate_workflow
+
+        definition = WorkflowDefinition(
+            {
+                "workflow": {
+                    "id": "test",
+                    "name": "Test",
+                    "version": "1.0.0",
+                },
+                "steps": [{"id": "bad", "type": step_type}],
+            }
+        )
+
+        errors = validate_workflow(definition)
+
+        assert errors == [
+            f"Step 'bad': 'type' must be a string, got "
+            f"{type(step_type).__name__} ({step_type!r})."
+        ]
 
     def test_nested_step_validation(self):
         from specify_cli.workflows.engine import WorkflowDefinition, validate_workflow
@@ -5037,6 +5252,36 @@ steps:
 
 class TestWorkflowEngine:
     """Test WorkflowEngine execution."""
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("integration", ["claude"]),
+            ("model", {"name": "gpt-5"}),
+            ("options", ["max_tokens"]),
+        ],
+    )
+    def test_execute_rejects_invalid_workflow_dispatch_defaults(
+        self, project_dir, field, value
+    ):
+        from specify_cli.workflows.engine import WorkflowDefinition, WorkflowEngine
+
+        definition = WorkflowDefinition(
+            {
+                "workflow": {
+                    "id": "invalid-dispatch-defaults",
+                    "name": "Invalid dispatch defaults",
+                    "version": "1.0.0",
+                    field: value,
+                },
+                "steps": [],
+            }
+        )
+
+        with pytest.raises(ValueError, match=f"workflow.{field}"):
+            WorkflowEngine(project_dir).execute(definition)
+
+        assert not (project_dir / ".specify" / "workflows" / "runs").exists()
 
     def test_load_from_file(self, sample_workflow_file, project_dir):
         from specify_cli.workflows.engine import WorkflowEngine
@@ -6557,6 +6802,45 @@ steps:
 # and abort the run.
 
 
+class TestWorkflowDispatchDefaultExecution:
+    """Execution safeguards for defaults inherited by dispatch steps."""
+
+    @pytest.mark.parametrize(
+        "defaults",
+        [
+            {
+                "integration": "claude",
+                "model": "gpt-5",
+                "options": {"max_tokens": 8000},
+            },
+            {"integration": None, "model": None, "options": None},
+        ],
+    )
+    def test_execute_accepts_valid_and_null_dispatch_defaults(
+        self, project_dir, defaults
+    ):
+        """Defaults with supported shapes remain executable without validation."""
+        from specify_cli.workflows.base import RunStatus
+        from specify_cli.workflows.engine import WorkflowDefinition, WorkflowEngine
+
+        definition = WorkflowDefinition(
+            {
+                "workflow": {
+                    "id": "valid-defaults",
+                    "name": "Valid Defaults",
+                    "version": "1.0.0",
+                    **defaults,
+                },
+                "steps": [],
+            }
+        )
+
+        state = WorkflowEngine(project_dir).execute(definition)
+
+        assert state.status == RunStatus.COMPLETED
+        assert state.step_results == {}
+
+
 class TestContinueOnError:
     """Test the `continue_on_error` step-level field."""
 
@@ -6982,6 +7266,35 @@ class TestRunState:
         with pytest.raises(FileNotFoundError):
             RunState.load("nonexistent", project_dir)
 
+    def test_load_rejects_stored_run_id_mismatch(self, project_dir):
+        """The state payload cannot redirect later writes to another run."""
+        from specify_cli.workflows.engine import RunState
+
+        run_dir = (
+            project_dir
+            / ".specify"
+            / "workflows"
+            / "runs"
+            / "requested-run"
+        )
+        run_dir.mkdir(parents=True)
+        (run_dir / "state.json").write_text(
+            json.dumps(
+                {
+                    "run_id": "other-run",
+                    "workflow_id": "test-workflow",
+                    "status": "created",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="stored run_id 'other-run' does not match requested run_id 'requested-run'",
+        ):
+            RunState.load("requested-run", project_dir)
+
     @pytest.mark.parametrize(
         ("installed_workflow_id", "installed_registry_root"),
         [
@@ -7231,6 +7544,94 @@ steps:
         runs = engine.list_runs()
         assert len(runs) == 1
         assert runs[0]["workflow_id"] == "list-test"
+
+    def test_list_skips_malformed_json(self, project_dir):
+        from specify_cli.workflows.engine import WorkflowEngine
+
+        runs_dir = project_dir / ".specify" / "workflows" / "runs"
+        bad_dir = runs_dir / "bad-run"
+        bad_dir.mkdir(parents=True)
+        (bad_dir / "state.json").write_text("{invalid json", encoding="utf-8")
+
+        engine = WorkflowEngine(project_dir)
+        assert engine.list_runs() == []
+
+    def test_list_skips_unreadable_file(self, project_dir):
+        import sys
+        import subprocess
+        from specify_cli.workflows.engine import WorkflowEngine
+
+        runs_dir = project_dir / ".specify" / "workflows" / "runs"
+        bad_dir = runs_dir / "bad-run"
+        bad_dir.mkdir(parents=True)
+        state_file = bad_dir / "state.json"
+        state_file.write_text('{"run_id": "x"}', encoding="utf-8")
+
+        if sys.platform == "win32":
+            subprocess.run(["attrib", "+R", str(state_file)], check=True)
+        else:
+            state_file.chmod(0o000)
+
+        try:
+            engine = WorkflowEngine(project_dir)
+            if sys.platform == "win32":
+                assert engine.list_runs() == [{"run_id": "x"}]
+            else:
+                assert engine.list_runs() == []
+        finally:
+            if sys.platform == "win32":
+                subprocess.run(["attrib", "-R", str(state_file)], check=True)
+            else:
+                state_file.chmod(0o644)
+
+    def test_list_skips_non_dict_payload(self, project_dir):
+        from specify_cli.workflows.engine import WorkflowEngine
+
+        runs_dir = project_dir / ".specify" / "workflows" / "runs"
+        bad_dir = runs_dir / "bad-run"
+        bad_dir.mkdir(parents=True)
+        (bad_dir / "state.json").write_text('["not", "a", "dict"]', encoding="utf-8")
+
+        engine = WorkflowEngine(project_dir)
+        assert engine.list_runs() == []
+
+    def test_list_skips_empty_dict_payload(self, project_dir):
+        from specify_cli.workflows.engine import WorkflowEngine
+
+        runs_dir = project_dir / ".specify" / "workflows" / "runs"
+        bad_dir = runs_dir / "bad-run"
+        bad_dir.mkdir(parents=True)
+        (bad_dir / "state.json").write_text('{}', encoding="utf-8")
+
+        engine = WorkflowEngine(project_dir)
+        assert engine.list_runs() == []
+
+    def test_list_skips_bad_file_with_valid_sibling(self, project_dir):
+        from specify_cli.workflows.engine import WorkflowEngine, WorkflowDefinition
+
+        runs_dir = project_dir / ".specify" / "workflows" / "runs"
+        bad_dir = runs_dir / "bad-run"
+        bad_dir.mkdir(parents=True)
+        (bad_dir / "state.json").write_text("{bad", encoding="utf-8")
+
+        yaml_str = """
+schema_version: "1.0"
+workflow:
+  id: "good-run"
+  name: "Good Run"
+  version: "1.0.0"
+steps:
+  - id: step-one
+    type: shell
+    run: "echo test"
+"""
+        definition = WorkflowDefinition.from_string(yaml_str)
+        engine = WorkflowEngine(project_dir)
+        engine.execute(definition)
+
+        runs = engine.list_runs()
+        assert len(runs) == 1
+        assert runs[0]["workflow_id"] == "good-run"
 
 
 # ===== Workflow Registry Tests =====
@@ -10718,6 +11119,45 @@ steps:
         with pytest.raises(ValueError):
             engine.resume(state.run_id, {"count": "not-a-number"})
 
+    def test_resume_rejects_legacy_invalid_options_before_state_mutation(
+        self, project_dir, monkeypatch
+    ):
+        from specify_cli.workflows.base import RunStatus
+        from specify_cli.workflows.engine import RunState, WorkflowDefinition
+
+        definition = WorkflowDefinition.from_string(self._WF_NUM)
+        engine = self._engine(project_dir)
+        state = engine.execute(definition)
+        assert state.status == RunStatus.PAUSED
+
+        workflow_copy = (
+            project_dir
+            / ".specify"
+            / "workflows"
+            / "runs"
+            / state.run_id
+            / "workflow.yml"
+        )
+        workflow_copy.write_text(
+            self._WF_NUM.replace(
+                'version: "1.0.0"', 'version: "1.0.0"\n  options: [max_tokens]'
+            ),
+            encoding="utf-8",
+        )
+
+        def fail_step_context(*args, **kwargs):
+            raise AssertionError("StepContext must not be created")
+
+        monkeypatch.setattr("specify_cli.workflows.engine.StepContext", fail_step_context)
+
+        with pytest.raises(ValueError, match="'workflow.options' must be a mapping or null"):
+            engine.resume(state.run_id, {"count": "5"})
+
+        reloaded = RunState.load(state.run_id, project_dir)
+        assert reloaded.status == RunStatus.PAUSED
+        assert reloaded.error is None
+        assert reloaded.inputs["count"] == 1
+
     def test_retry_verdict_input_is_consumed_and_can_be_replaced(self, project_dir):
         import json as _json
         from specify_cli.workflows.engine import WorkflowDefinition
@@ -12096,6 +12536,46 @@ steps:
             )
         assert result.exit_code != 0
         assert "exceedsthe100-byteworkflowsizelimit" in "".join(result.output.split())
+        leaked = list(scratch_tmp.glob("*.yml"))
+        assert leaked == [], f"leaked temp files: {leaked}"
+
+    def test_add_from_url_interrupt_during_read_leaves_no_temp_file(
+        self, project_dir, monkeypatch, tmp_path
+    ):
+        """A KeyboardInterrupt while streaming the response body must still
+        unlink the already-created (delete=False) temp file. Unlike a
+        download ``ValueError``, ``KeyboardInterrupt`` is a ``BaseException``
+        and is not caught by ``except Exception`` -- only a ``BaseException``
+        handler around the temp-file lifetime can clean it up."""
+        import tempfile as tempfile_mod
+        from unittest.mock import patch
+        from typer.testing import CliRunner
+        from specify_cli import app
+        from specify_cli.workflows import _commands as wf_commands
+
+        monkeypatch.chdir(project_dir)
+        scratch_tmp = tmp_path / "scratch-tmp"
+        scratch_tmp.mkdir()
+        monkeypatch.setattr(tempfile_mod, "tempdir", str(scratch_tmp))
+
+        def _boom(*args, **kwargs):
+            raise KeyboardInterrupt()
+
+        monkeypatch.setattr(wf_commands, "_read_response_within_limit", _boom)
+        body = b"id: align-wf\n"
+        runner = CliRunner()
+        with patch(
+            "specify_cli.authentication.http.open_url",
+            side_effect=lambda url, timeout=None, extra_headers=None, redirect_validator=None: self._FakeResponse(
+                body, url
+            ),
+        ):
+            result = runner.invoke(
+                app,
+                ["workflow", "add", "align-wf", "--from", "https://example.com/workflow.yml"],
+                input="y\n",
+            )
+        assert result.exit_code != 0
         leaked = list(scratch_tmp.glob("*.yml"))
         assert leaked == [], f"leaked temp files: {leaked}"
 
@@ -16515,6 +16995,57 @@ steps:
         captured = capsys.readouterr()
         assert "corrupt run state" in captured.err
         assert "corrupt run state" not in captured.out
+        assert captured.out.strip() == ""
+
+    def test_status_unreadable_run_state_exits_cleanly(
+        self, project_dir, monkeypatch
+    ):
+        """`workflow status <run_id>` gained a ValueError boundary to match
+        `workflow resume`, but not resume's OSError one -- so an unreadable
+        state.json (bad permissions, a directory in its place, an I/O error)
+        still leaked a raw traceback. exists() is True for a directory, so
+        the guard passes and open() raises OSError."""
+        from typer.testing import CliRunner
+        from specify_cli import app
+
+        monkeypatch.chdir(project_dir)
+        runs_dir = project_dir / ".specify" / "workflows" / "runs" / "abc123"
+        runs_dir.mkdir(parents=True, exist_ok=True)
+        # A directory where state.json should be: exists() passes, open() fails.
+        (runs_dir / "state.json").mkdir(exist_ok=True)
+
+        runner = CliRunner()
+        result = runner.invoke(app, ["workflow", "status", "abc123"])
+        assert result.exit_code != 0
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert "Error" in result.output
+
+    def test_status_json_unreadable_run_state_error_goes_to_stderr(
+        self, project_dir, monkeypatch, capsys
+    ):
+        """The OSError handler must route to stderr under --json too, so the
+        stdout JSON stream stays parseable -- mirroring the sibling
+        FileNotFoundError/ValueError handlers."""
+        import typer
+        from specify_cli.workflows import _commands
+        from specify_cli.workflows.engine import RunState
+
+        (project_dir / ".specify" / "workflows").mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(
+            _commands, "_require_specify_project", lambda: project_dir
+        )
+
+        def _raise_os_error(*args, **kwargs):
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr(RunState, "load", _raise_os_error)
+
+        with pytest.raises(typer.Exit) as exc:
+            _commands.workflow_status("some-run", json_output=True)
+        assert exc.value.exit_code == 1
+        captured = capsys.readouterr()
+        assert "Permission denied" in captured.err
+        assert "Permission denied" not in captured.out
         assert captured.out.strip() == ""
 
     def test_status_no_run_id_list_path_unaffected(self, project_dir, monkeypatch):

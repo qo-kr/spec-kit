@@ -69,8 +69,11 @@ class TestInitIntegrationFlag:
         finally:
             os.chdir(old_cwd)
         assert result.exit_code == 0, f"init failed: {result.output}"
-        assert (project / ".github" / "agents" / "speckit.plan.agent.md").exists()
-        assert (project / ".github" / "prompts" / "speckit.plan.prompt.md").exists()
+        assert (
+            project / ".github" / "skills" / "speckit-plan" / "SKILL.md"
+        ).exists()
+        assert not (project / ".github" / "agents").exists()
+        assert not (project / ".github" / "prompts").exists()
         assert (project / ".specify" / "scripts" / "bash" / "common.sh").exists()
 
         data = json.loads((project / ".specify" / "integration.json").read_text(encoding="utf-8"))
@@ -78,6 +81,7 @@ class TestInitIntegrationFlag:
 
         opts = json.loads((project / ".specify" / "init-options.json").read_text(encoding="utf-8"))
         assert opts["integration"] == "copilot"
+        assert opts["ai_skills"] is True
         # init must not leave any legacy agent-context keys in init-options.json
         assert "context_file" not in opts
 
@@ -111,10 +115,202 @@ class TestInitIntegrationFlag:
 
         assert result.exit_code == 0, result.output
         assert f"defaulting to '{specify_cli.DEFAULT_INIT_INTEGRATION}'" in result.output
-        assert (project / ".github" / "agents" / "speckit.plan.agent.md").exists()
+        assert (
+            project / ".github" / "skills" / "speckit-plan" / "SKILL.md"
+        ).exists()
 
         data = json.loads((project / ".specify" / "integration.json").read_text(encoding="utf-8"))
         assert data["integration"] == specify_cli.DEFAULT_INIT_INTEGRATION
+
+    def test_noninteractive_flag_skips_pickers_when_stdin_is_a_tty(
+        self, tmp_path, monkeypatch
+    ):
+        """Agent harnesses often allocate a PTY (isatty True) but cannot send
+        arrow keys. ``--non-interactive`` must still skip both pickers and apply
+        documented defaults — the hang reported in #4152.
+        """
+        from typer.testing import CliRunner
+        from specify_cli import app
+        import specify_cli
+        import specify_cli.commands.init as init_mod
+
+        monkeypatch.setattr(init_mod, "_stdin_is_interactive", lambda: True)
+
+        def fail_select(*_args, **_kwargs):
+            raise AssertionError(
+                "--non-interactive must not open select_with_arrows even on a TTY"
+            )
+
+        monkeypatch.setattr(init_mod, "select_with_arrows", fail_select)
+
+        runner = CliRunner()
+        project = tmp_path / "agent-pty"
+        result = runner.invoke(
+            app,
+            ["init", str(project), "--non-interactive", "--ignore-agent-tools"],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0, result.output
+        assert f"defaulting to '{specify_cli.DEFAULT_INIT_INTEGRATION}'" in result.output
+
+        data = json.loads((project / ".specify" / "integration.json").read_text(encoding="utf-8"))
+        assert data["integration"] == specify_cli.DEFAULT_INIT_INTEGRATION
+
+    def test_noninteractive_flag_here_nonempty_requires_force(
+        self, tmp_path, monkeypatch
+    ):
+        """``--non-interactive`` on a non-empty --here directory must fail fast
+        asking for --force, even when stdin looks like a TTY.
+        """
+        from typer.testing import CliRunner
+        from specify_cli import app
+        import specify_cli.commands.init as init_mod
+
+        monkeypatch.setattr(init_mod, "_stdin_is_interactive", lambda: True)
+
+        def fail_select(*_args, **_kwargs):
+            raise AssertionError("picker must not run under --non-interactive")
+
+        monkeypatch.setattr(init_mod, "select_with_arrows", fail_select)
+
+        def fail_confirm(*_args, **_kwargs):
+            raise AssertionError(
+                "--non-interactive must not call typer.confirm for a non-empty --here directory"
+            )
+
+        monkeypatch.setattr("typer.confirm", fail_confirm)
+
+        project = tmp_path / "nonempty-here-flag"
+        project.mkdir()
+        (project / "existing.txt").write_text("keep me", encoding="utf-8")
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(project)
+            result = CliRunner().invoke(
+                app,
+                [
+                    "init",
+                    "--here",
+                    "--non-interactive",
+                    "--integration",
+                    "copilot",
+                    "--ignore-agent-tools",
+                ],
+                catch_exceptions=False,
+            )
+        finally:
+            os.chdir(old_cwd)
+
+        assert result.exit_code == 1, result.output
+        assert "--force" in result.output
+        assert "--non-interactive" in result.output
+        assert (project / "existing.txt").read_text(encoding="utf-8") == "keep me"
+
+    def test_noninteractive_flag_here_force_completes_without_script_flag(
+        self, tmp_path, monkeypatch
+    ):
+        """The #4152 reproduction: ``--here --force --integration`` without
+        ``--script`` must not hang on the script picker when --non-interactive
+        is set, even if stdin is a TTY.
+        """
+        from typer.testing import CliRunner
+        from specify_cli import app
+        import specify_cli.commands.init as init_mod
+
+        monkeypatch.setattr(init_mod, "_stdin_is_interactive", lambda: True)
+
+        def fail_select(*_args, **_kwargs):
+            raise AssertionError("script picker must not run under --non-interactive")
+
+        monkeypatch.setattr(init_mod, "select_with_arrows", fail_select)
+
+        project = tmp_path / "here-force-agent"
+        project.mkdir()
+        (project / "existing.txt").write_text("keep me", encoding="utf-8")
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(project)
+            result = CliRunner().invoke(
+                app,
+                [
+                    "init",
+                    "--here",
+                    "--force",
+                    "--non-interactive",
+                    "--integration",
+                    "claude",
+                    "--ignore-agent-tools",
+                ],
+                catch_exceptions=False,
+            )
+        finally:
+            os.chdir(old_cwd)
+
+        assert result.exit_code == 0, result.output
+        assert (project / ".specify" / "init-options.json").exists()
+
+    def test_noninteractive_init_honors_default_integration_env_var(
+        self, tmp_path, monkeypatch
+    ):
+        from typer.testing import CliRunner
+        from specify_cli import app
+        import specify_cli
+
+        def fail_select(*_args, **_kwargs):
+            raise AssertionError("non-interactive init should not open the integration picker")
+
+        monkeypatch.setattr(specify_cli, "select_with_arrows", fail_select)
+        monkeypatch.setenv(
+            specify_cli.DEFAULT_INIT_INTEGRATION_ENV_VAR, "gemini"
+        )
+
+        runner = CliRunner()
+        project = tmp_path / "noninteractive_env"
+        result = runner.invoke(app, [
+            "init", str(project), "--script", "sh", "--ignore-agent-tools",
+        ], catch_exceptions=False)
+
+        assert result.exit_code == 0, result.output
+        assert "defaulting to 'gemini'" in result.output
+
+        data = json.loads((project / ".specify" / "integration.json").read_text(encoding="utf-8"))
+        assert data["integration"] == "gemini"
+
+    def test_interactive_init_picker_default_honors_env_var(
+        self, tmp_path, monkeypatch
+    ):
+        # The interactive integration picker must receive the resolved
+        # SPECKIT_INTEGRATION_DEFAULT value as its default_key, not the
+        # hardcoded constant (guards the picker wiring against regression).
+        from typer.testing import CliRunner
+        from specify_cli import app
+        import specify_cli.commands.init as init_mod
+
+        monkeypatch.setattr(init_mod, "_stdin_is_interactive", lambda: True)
+        monkeypatch.setenv("SPECKIT_INTEGRATION_DEFAULT", "gemini")
+
+        captured = {}
+
+        def fake_select(options, prompt_text=None, default_key=None, **_kwargs):
+            # Only capture the integration picker (not the script picker).
+            if "Choose your coding agent integration" in (prompt_text or ""):
+                captured["default_key"] = default_key
+            return default_key
+
+        monkeypatch.setattr(init_mod, "select_with_arrows", fake_select)
+
+        runner = CliRunner()
+        project = tmp_path / "interactive_env"
+        result = runner.invoke(app, [
+            "init", str(project), "--script", "sh", "--ignore-agent-tools",
+        ], catch_exceptions=False)
+
+        assert result.exit_code == 0, result.output
+        assert captured.get("default_key") == "gemini"
+
+        data = json.loads((project / ".specify" / "integration.json").read_text(encoding="utf-8"))
+        assert data["integration"] == "gemini"
 
     def test_init_here_nonempty_noninteractive_errors_with_force_guidance(self, tmp_path):
         """`init --here` on a non-empty directory with no confirmation input (empty
@@ -188,7 +384,9 @@ class TestInitIntegrationFlag:
         finally:
             os.chdir(old_cwd)
         assert result.exit_code == 0
-        assert (project / ".github" / "agents" / "speckit.plan.agent.md").exists()
+        assert (
+            project / ".github" / "skills" / "speckit-plan" / "SKILL.md"
+        ).exists()
 
     def test_init_optional_preset_failure_reports_target_and_continues(
         self, tmp_path, monkeypatch
@@ -997,6 +1195,99 @@ class TestInitIntegrationFlag:
         assert "not updated" in result.output
 
 
+    def test_init_here_force_reapplies_installed_presets(self, tmp_path, monkeypatch):
+        """Regression for #3990: init --here --force must call _register_presets_for_agent
+        after setup() so preset-composed files are not silently reverted to core."""
+        from unittest.mock import MagicMock, patch
+
+        from typer.testing import CliRunner
+
+        from specify_cli import app
+
+        project = tmp_path / "force-preset-reapply"
+        project.mkdir()
+
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(project)
+            runner = CliRunner()
+
+            # First init to create a valid project structure.
+            result = runner.invoke(app, [
+                "init", "--here", "--force",
+                "--integration", "claude",
+                "--script", "sh",
+                "--ignore-agent-tools",
+            ], catch_exceptions=False)
+            assert result.exit_code == 0, result.output
+
+            # Second init --here --force: verify _register_presets_for_agent is called.
+            # Patch at the source module since init.py does a lazy import of these functions.
+            mock_presets = MagicMock()
+            mock_extensions = MagicMock()
+            with (
+                patch(
+                    "specify_cli.integrations._helpers._register_presets_for_agent",
+                    mock_presets,
+                ),
+                patch(
+                    "specify_cli.integrations._helpers._register_extensions_for_agent",
+                    mock_extensions,
+                ),
+            ):
+                result2 = runner.invoke(app, [
+                    "init", "--here", "--force",
+                    "--integration", "claude",
+                    "--script", "sh",
+                    "--ignore-agent-tools",
+                ], catch_exceptions=False)
+        finally:
+            os.chdir(old_cwd)
+
+        assert result2.exit_code == 0, result2.output
+        assert mock_presets.called, (
+            "_register_presets_for_agent was not called during init --here --force"
+        )
+        assert mock_extensions.called, (
+            "_register_extensions_for_agent was not called during init --here --force"
+        )
+
+    def test_init_here_without_force_does_not_reapply_presets(self, tmp_path):
+        """Without --force (fresh project), _register_presets_for_agent should NOT be called."""
+        from unittest.mock import MagicMock, patch
+
+        from typer.testing import CliRunner
+
+        from specify_cli import app
+
+        project = tmp_path / "no-force-preset"
+        project.mkdir()
+
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(project)
+            runner = CliRunner()
+            mock_presets = MagicMock()
+            with patch(
+                "specify_cli.integrations._helpers._register_presets_for_agent",
+                mock_presets,
+            ):
+                result = runner.invoke(app, [
+                    "init", "--here",
+                    "--integration", "claude",
+                    "--script", "sh",
+                    "--ignore-agent-tools",
+                ], catch_exceptions=False)
+        finally:
+            os.chdir(old_cwd)
+
+        assert result.exit_code == 0, result.output
+        # On a fresh project without --force the reapply guard should not fire.
+        assert not mock_presets.called, (
+            "_register_presets_for_agent should not be called on a fresh init without --force"
+        )
+
+
 class TestForceExistingDirectory:
     """Tests for --force merging into an existing named directory."""
 
@@ -1311,7 +1602,7 @@ class TestSharedInfraCommandRefs:
         assert "/speckit.specify" not in script_content
 
     def test_full_init_copilot_resolves_page_templates(self, tmp_path):
-        """Full CLI init with Copilot (markdown agent) produces dot refs in page templates."""
+        """Default Copilot skills mode produces hyphen refs in page templates."""
         from typer.testing import CliRunner
         from specify_cli import app
 
@@ -1333,27 +1624,28 @@ class TestSharedInfraCommandRefs:
 
         plan = project / ".specify" / "templates" / "plan-template.md"
         content = plan.read_text(encoding="utf-8")
-        assert "/speckit.plan" in content, "Copilot (markdown) should use /speckit.plan"
+        assert "/speckit-plan" in content, "Copilot skills should use /speckit-plan"
+        assert "/speckit.plan" not in content
         assert "__SPECKIT_COMMAND_" not in content
 
         script_content = self._combined_script_content(project, "sh")
-        assert "/speckit.specify" in script_content
-        assert "/speckit-specify" not in script_content
+        assert "/speckit-specify" in script_content
+        assert "/speckit.specify" not in script_content
 
-    def test_full_init_copilot_skills_resolves_page_templates(self, tmp_path):
-        """Full CLI init with Copilot --skills produces hyphen refs in page templates."""
+    def test_full_init_copilot_commands_resolves_page_templates(self, tmp_path):
+        """Copilot --commands produces dot refs in page templates."""
         from typer.testing import CliRunner
         from specify_cli import app
 
         runner = CliRunner()
-        project = tmp_path / "init-copilot-skills"
+        project = tmp_path / "init-copilot-commands"
         old_cwd = os.getcwd()
         try:
             os.chdir(tmp_path)
             result = runner.invoke(app, [
                 "init", str(project),
                 "--integration", "copilot",
-                "--integration-options", "--skills",
+                "--integration-options", "--commands",
                 "--script", "sh",
                 "--ignore-agent-tools",
             ], catch_exceptions=False)
@@ -1364,13 +1656,13 @@ class TestSharedInfraCommandRefs:
 
         plan = project / ".specify" / "templates" / "plan-template.md"
         content = plan.read_text(encoding="utf-8")
-        assert "/speckit-plan" in content, "Copilot --skills should use /speckit-plan"
-        assert "/speckit.plan" not in content, "dot-notation leaked into Copilot skills page template"
+        assert "/speckit.plan" in content, "Copilot --commands should use /speckit.plan"
+        assert "/speckit-plan" not in content
         assert "__SPECKIT_COMMAND_" not in content
 
         script_content = self._combined_script_content(project, "sh")
-        assert "/speckit-specify" in script_content
-        assert "/speckit.specify" not in script_content
+        assert "/speckit.specify" in script_content
+        assert "/speckit-specify" not in script_content
 
 
 class TestIntegrationCatalogDiscoveryCLI:
@@ -2524,6 +2816,130 @@ class TestExtensionFlag:
         normalized = _normalize_cli_output(result.output)
         assert "untrusted url" in normalized.lower()
         assert not (project / ".specify" / "extensions" / "git").exists()
+
+    def test_noninteractive_flag_skips_url_trust_prompt_when_stdin_is_a_tty(
+        self, tmp_path, monkeypatch
+    ):
+        """``--non-interactive`` must not call ``typer.confirm`` for an HTTPS
+        ``--extension`` even when stdin is a TTY. Without
+        ``--trust-extension-urls`` the URL is denied (default-deny). Guards the
+        ``allow_prompt`` wiring added for #4152.
+        """
+        from unittest.mock import patch
+
+        import specify_cli.commands.init as init_mod
+
+        monkeypatch.setattr(init_mod, "_stdin_is_interactive", lambda: True)
+
+        def fail_select(*_args, **_kwargs):
+            raise AssertionError("--non-interactive must not open select_with_arrows")
+
+        def fail_confirm(*_args, **_kwargs):
+            raise AssertionError(
+                "--non-interactive must not prompt for URL extension trust"
+            )
+
+        monkeypatch.setattr(init_mod, "select_with_arrows", fail_select)
+
+        with patch("typer.confirm", side_effect=fail_confirm), patch(
+            "specify_cli.authentication.http.open_url"
+        ) as mock_open:
+            project, result = self._run_init(
+                tmp_path,
+                [
+                    "--non-interactive",
+                    "--extension",
+                    "https://example.com/git.zip",
+                ],
+                project_name="ext-url-noninteractive-tty",
+            )
+
+        assert result.exit_code == 0, f"init failed:\n{result.output}"
+        mock_open.assert_not_called()
+        normalized = _normalize_cli_output(result.output)
+        assert "untrusted url" in normalized.lower()
+        assert "--trust-extension-urls" in result.output
+        assert not (project / ".specify" / "extensions" / "git").exists()
+
+    def test_noninteractive_flag_trust_urls_installs_without_confirm(
+        self, tmp_path, monkeypatch
+    ):
+        """``--non-interactive --trust-extension-urls`` installs an HTTPS
+        extension without calling ``typer.confirm``, even when stdin is a TTY.
+        """
+        import io
+
+        from unittest.mock import patch
+
+        from specify_cli import _locate_bundled_extension
+        import specify_cli.commands.init as init_mod
+
+        bundled_git = _locate_bundled_extension("git")
+        assert bundled_git is not None, "bundled git extension not found"
+        zip_bytes = self._zip_bytes_from_dir(bundled_git)
+
+        class FakeResponse(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        def _cache_dir_stand_in(project_root):
+            d = project_root / ".specify" / "extensions" / ".cache" / "downloads"
+            d.mkdir(parents=True, exist_ok=True)
+            return d
+
+        def _open_download_zip(project_root, download_dir, zip_filename):
+            target = download_dir / zip_filename
+            o_temporary = getattr(os, "O_TEMPORARY", 0)
+            if o_temporary:
+                return os.open(
+                    target, os.O_RDWR | os.O_CREAT | os.O_EXCL | o_temporary, 0o600
+                )
+            fd = os.open(target, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                os.unlink(target)
+            except OSError:
+                os.close(fd)
+                raise
+            return fd
+
+        monkeypatch.setattr(init_mod, "_stdin_is_interactive", lambda: True)
+
+        def fail_select(*_args, **_kwargs):
+            raise AssertionError("--non-interactive must not open select_with_arrows")
+
+        def fail_confirm(*_args, **_kwargs):
+            raise AssertionError(
+                "--non-interactive must not prompt for URL extension trust"
+            )
+
+        monkeypatch.setattr(init_mod, "select_with_arrows", fail_select)
+
+        with patch("typer.confirm", side_effect=fail_confirm), patch(
+            "specify_cli.authentication.http.open_url",
+            return_value=FakeResponse(zip_bytes),
+        ), patch(
+            "specify_cli.extensions._commands._validate_safe_cache_dir",
+            side_effect=_cache_dir_stand_in,
+        ), patch(
+            "specify_cli.extensions._commands._safe_open_download_zip",
+            side_effect=_open_download_zip,
+        ):
+            project, result = self._run_init(
+                tmp_path,
+                [
+                    "--non-interactive",
+                    "--extension",
+                    "https://example.com/git.zip",
+                    "--trust-extension-urls",
+                ],
+                project_name="ext-url-noninteractive-trust",
+            )
+
+        assert result.exit_code == 0, f"init failed:\n{result.output}"
+        assert (project / ".specify" / "extensions" / "git").exists()
 
     def test_url_extension_interactive_confirm_installs(self, tmp_path):
         """An interactive 'yes' to the trust prompt allows the URL install."""

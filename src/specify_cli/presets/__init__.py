@@ -56,6 +56,7 @@ from ..shared_infra import (
 
 
 _CONSTITUTION_PROVENANCE_FILE = ".constitution-template.json"
+_CONSTITUTION_SYNC_PRESET_ID = "constitution-sync"
 
 
 def _content_sha256(content: bytes) -> str:
@@ -178,7 +179,7 @@ def _substitute_core_template(
         by the core template body and core_frontmatter holds the core template's parsed
         frontmatter (so callers can inherit scripts/agent_scripts from it).  Both are
         unchanged / empty when the placeholder is absent or the core template file does
-        not exist.
+        not exist or cannot be read.
     """
     if "{CORE_TEMPLATE}" not in body:
         return body, {}
@@ -208,7 +209,23 @@ def _substitute_core_template(
     if core_file is None:
         return body, {}
 
-    core_frontmatter, core_body = registrar.parse_frontmatter(core_file.read_text(encoding="utf-8"))
+    # Treat an unreadable/undecodable core template like a missing one so a
+    # single corrupted project override cannot crash command registration —
+    # the wrap-strategy callers already skip an unreadable preset source with
+    # a warning (CommandRegistrar.register_pack).
+    try:
+        core_content = core_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        import warnings
+
+        warnings.warn(
+            f"Ignoring core template for command '{cmd_name}': could not read "
+            f"'{core_file.name}' ({exc.__class__.__name__}: {exc}).",
+            stacklevel=2,
+        )
+        return body, {}
+
+    core_frontmatter, core_body = registrar.parse_frontmatter(core_content)
     return body.replace("{CORE_TEMPLATE}", core_body), core_frontmatter
 
 
@@ -307,9 +324,25 @@ class PresetManifest:
 
         # Validate preset metadata
         pack = self.data["preset"]
+        # Check presence AND type: the format/version checks below feed these
+        # values straight to ``re.match`` and ``packaging.Version``, both of
+        # which raise a bare TypeError on a non-string. YAML makes that an easy
+        # authoring slip -- unquoted ``version: 1.0`` parses as a float and
+        # ``id: 2`` as an int -- and TypeError is not a PresetValidationError,
+        # so it escapes every caller that already handles a malformed manifest
+        # (see list_installed()'s "Corrupted preset" fallback, which catches
+        # PresetValidationError only, making one bad preset exit ``specify
+        # preset list`` with a raw traceback and hide the healthy ones).
+        # Mirrors the sibling IntegrationDescriptor, which already type-checks
+        # the same four fields.
         for field in ["id", "name", "version", "description"]:
             if field not in pack:
                 raise PresetValidationError(f"Missing preset.{field}")
+            if not isinstance(pack[field], str):
+                raise PresetValidationError(
+                    f"Invalid preset.{field}: expected a string, "
+                    f"got {type(pack[field]).__name__}"
+                )
 
         # Validate pack ID format
         if not re.match(r'^[a-z0-9-]+$', pack["id"]):
@@ -328,6 +361,25 @@ class PresetManifest:
         requires = self.data["requires"]
         if "speckit_version" not in requires:
             raise PresetValidationError("Missing requires.speckit_version")
+        # Presence alone is not enough: check_compatibility() feeds this value to
+        # ``SpecifierSet(required)``, guarded only by ``except InvalidSpecifier``,
+        # which a non-string escapes two different ways. A float/int/bool/None
+        # raises TypeError from the constructor, while a list or dict is an
+        # *iterable*, so SpecifierSet accepts it and the failure surfaces much
+        # later as ``AttributeError: 'str' object has no attribute 'filter'`` from
+        # inside .contains(). Neither is a PresetCompatibilityError, so both
+        # bypass the CLI's "Compatibility Error" handler and exit 1 with a raw
+        # traceback naming no field. An unquoted ``speckit_version: 1.0`` is an
+        # easy YAML slip. Mirrors the sibling IntegrationDescriptor, which already
+        # requires a non-empty string here.
+        if (
+            not isinstance(requires["speckit_version"], str)
+            or not requires["speckit_version"].strip()
+        ):
+            raise PresetValidationError(
+                "Invalid requires.speckit_version: expected a non-empty string, "
+                f"got {type(requires['speckit_version']).__name__}"
+            )
 
         # Validate provides section
         provides = self.data["provides"]
@@ -366,6 +418,19 @@ class PresetManifest:
                 raise PresetValidationError(
                     "Template missing 'type', 'name', or 'file'"
                 )
+
+            # 'name' feeds re.match and 'file' feeds os.path.normpath below;
+            # both raise a bare TypeError on a non-string, which is not a
+            # PresetValidationError and so escapes the callers that handle a
+            # malformed manifest. The sibling extension manifest already
+            # rejects a non-string command 'file' via
+            # relative_extension_path_violation().
+            for field in ("type", "name", "file"):
+                if not isinstance(tmpl[field], str):
+                    raise PresetValidationError(
+                        f"Invalid template {field}: expected a string, "
+                        f"got {type(tmpl[field]).__name__}"
+                    )
 
             if tmpl["type"] not in VALID_PRESET_TEMPLATE_TYPES:
                 raise PresetValidationError(
@@ -502,7 +567,12 @@ class PresetRegistry:
             if not isinstance(data.get("presets"), dict):
                 data["presets"] = {}
             return data
-        except (json.JSONDecodeError, FileNotFoundError):
+        except (json.JSONDecodeError, UnicodeDecodeError, FileNotFoundError):
+            # Corrupted or missing registry, start fresh. A registry whose
+            # bytes cannot be decoded as UTF-8 is the same corruption class
+            # as malformed JSON — only the exception type differs. OSError is
+            # deliberately not caught: the data may be intact on disk, and
+            # starting fresh would let a later _save() wipe it.
             return {
                 "schema_version": self.SCHEMA_VERSION,
                 "presets": {}
@@ -727,6 +797,18 @@ class PresetManager:
             PresetCompatibilityError: If pack is incompatible
         """
         required = manifest.requires_speckit_version
+        # Defense in depth: the manifest validator now rejects a non-string
+        # requires.speckit_version, but this method is public and also reachable
+        # with a hand-built manifest object. ``InvalidSpecifier`` alone does not
+        # cover a non-string -- scalars raise TypeError from the constructor, and
+        # a list/dict is iterable so it constructs here and only breaks inside
+        # .contains(). Reject up front so this always reports a
+        # PresetCompatibilityError.
+        if not isinstance(required, str):
+            raise PresetCompatibilityError(
+                "Invalid version specifier: expected a string, got "
+                f"{type(required).__name__} ({required!r})"
+            )
         try:
             SpecifierSet(required)  # Just to validate
         except InvalidSpecifier:
@@ -739,25 +821,6 @@ class PresetManager:
                 f"Upgrade spec-kit with: {REINSTALL_COMMAND}"
             )
 
-        return True
-
-    def _extension_installed_for_command(self, command_name: str) -> bool:
-        """Whether *command_name* may be materialized in this project.
-
-        Extension command overrides follow ``speckit.<ext-id>.<cmd-name>``;
-        they must be skipped everywhere preset artifacts are written —
-        registration *and* reconciliation — when the extension isn't
-        installed, or reconciliation would materialize files that
-        registration refused to track. Core commands (single-dot names,
-        e.g. ``speckit.specify``) always pass.
-        """
-        parts = command_name.split(".")
-        if len(parts) >= 3 and parts[0] == "speckit":
-            ext_id = parts[1]
-            if not (
-                self.project_root / ".specify" / "extensions" / ext_id
-            ).is_dir():
-                return False
         return True
 
     def _register_commands(
@@ -788,21 +851,20 @@ class PresetManager:
         if not command_templates:
             return {}
 
-        # Filter out extension command overrides if the extension isn't installed.
-        filtered = [
-            cmd
-            for cmd in command_templates
-            if self._extension_installed_for_command(cmd["name"])
-        ]
-
-        if not filtered:
-            return {}
-
+        # A preset command template always ships its own body, so it is
+        # self-contained and scaffolds regardless of whether any similarly
+        # named extension is installed. Namespaced names (speckit.<ns>.<cmd>)
+        # are treated exactly like short names (speckit.<cmd>) — they are NOT
+        # filtered out just because ``.specify/extensions/<ns>/`` is absent.
+        # The only command that cannot be materialized is a composition
+        # (prepend/append/wrap) with no base layer to compose onto; that case
+        # is handled per-command below (warn + skip), not by dropping names up
+        # front.
         # Handle composition strategies: resolve composed content for non-replace commands
         resolver = PresetResolver(self.project_root)
         composed_dir = None
         commands_to_register = []
-        for cmd in filtered:
+        for cmd in command_templates:
             strategy = cmd.get("strategy", "replace")
             if strategy != "replace":
                 # Only pre-compose if this preset is the top composing layer.
@@ -825,13 +887,23 @@ class PresetManager:
                             "file": f".composed/{cmd['name']}.md",
                         })
                     else:
-                        raise PresetValidationError(
-                            f"Command '{cmd['name']}' uses '{strategy}' strategy "
-                            f"but no base command layer exists to compose onto. "
-                            f"Ensure a lower-priority preset, extension, or core "
-                            f"command provides this command before using "
-                            f"composition strategies."
+                        # No base layer to compose onto (e.g. the command it
+                        # would wrap comes from an extension that isn't
+                        # installed). Warn and skip this single command rather
+                        # than aborting the whole install — mirrors the
+                        # "composed is None" branch in
+                        # _reconcile_composed_commands so command-mode and
+                        # reconciliation behave identically.
+                        import warnings
+                        warnings.warn(
+                            f"Command '{cmd['name']}' uses '{strategy}' "
+                            f"strategy but no base command layer exists to "
+                            f"compose onto; skipping. Provide a lower-priority "
+                            f"preset, extension, or core command for it before "
+                            f"using composition strategies.",
+                            stacklevel=2,
                         )
+                        continue
                 else:
                     # Not the top layer — register raw file; reconciliation
                     # will overwrite with the correct composed/winning content.
@@ -1599,21 +1671,13 @@ class PresetManager:
         if not command_names:
             return set()
 
-        # Never materialize extension-scoped commands whose extension isn't
-        # installed. Registration (_register_commands / _register_skills)
-        # already refuses them, so a reconciliation pass writing them would
-        # create files no registry entry tracks. Filtering here — the single
-        # chokepoint every install/remove/rescaffold reconciliation funnels
-        # through — keeps all callers consistent without each one re-applying
-        # the filter when seeding names from manifest templates.
-        command_names = [
-            name
-            for name in command_names
-            if self._extension_installed_for_command(name)
-        ]
-        if not command_names:
-            return set()
-
+        # Every preset-owned command name flows through unchanged. Names are
+        # NOT filtered by the ``speckit.<ns>.<cmd>`` shape: a self-contained
+        # preset command scaffolds whether or not a like-named extension is
+        # installed (parity with _register_commands), and a name whose base
+        # layer has disappeared must still reach the loop below so its now
+        # uncomposable stale file gets unregistered. The loop already skips
+        # names that resolve to no layers at all (``if not layers: continue``).
         try:
             from ..agents import CommandRegistrar
         except ImportError:
@@ -2054,14 +2118,11 @@ class PresetManager:
         if not command_names:
             return set()
 
-        command_names = [
-            name
-            for name in command_names
-            if self._extension_installed_for_command(name)
-        ]
-        if not command_names:
-            return set()
-
+        # Preset-owned command names are not filtered by the
+        # ``speckit.<ns>.<cmd>`` shape here either: a self-contained preset
+        # command renders its skill whether or not a like-named extension is
+        # installed. The per-name loop below skips anything that doesn't
+        # resolve to a managed skill directory.
         resolver = PresetResolver(self.project_root)
         active_skills_dir = self._get_skills_dir()
 
@@ -2157,7 +2218,10 @@ class PresetManager:
             ]
             if dir_core_ext_names:
                 self._unregister_skills_in_dir(
-                    dir_core_ext_names, skills_dir, dir_agent
+                    dir_core_ext_names,
+                    skills_dir,
+                    dir_agent,
+                    restore_from_bundled_core=True,
                 )
 
             for _skill_name, cmd_name, top_layer in override_skills:
@@ -2588,20 +2652,16 @@ class PresetManager:
         if not command_templates:
             return {}
 
-        # Filter out extension command overrides if the extension isn't installed,
-        # matching the same logic used by _register_commands().
-        filtered = [
-            cmd
-            for cmd in command_templates
-            if self._extension_installed_for_command(cmd["name"])
-        ]
-
-        if not filtered:
-            return {}
-
+        # Preset command templates are self-contained and render as skills
+        # regardless of whether a like-named extension is installed — the same
+        # rule _register_commands() uses. No ``speckit.<ns>.<cmd>`` name-shape
+        # filtering; the per-command loop below skips anything without a target
+        # skill directory.
         skills_dir = target_dir if target_dir is not None else self._get_skills_dir()
         if not skills_dir:
             return {}
+
+        resolver = PresetResolver(self.project_root)
 
         from .. import SKILL_DESCRIPTIONS, load_init_options
         from ..agents import CommandRegistrar
@@ -2632,7 +2692,7 @@ class PresetManager:
 
         written: List[str] = []
 
-        for cmd_tmpl in filtered:
+        for cmd_tmpl in command_templates:
             cmd_name = cmd_tmpl["name"]
             cmd_file_rel = cmd_tmpl["file"]
             source_file = preset_dir / cmd_file_rel
@@ -2672,10 +2732,33 @@ class PresetManager:
             content = source_file.read_text(encoding="utf-8")
             frontmatter, body = registrar.parse_frontmatter(content)
 
+            # A composition-strategy command (wrap/prepend/append) needs a
+            # base layer to compose onto. When _register_commands produced no
+            # composed file for it and the stack still has no base
+            # (resolve_content is None) — e.g. the command it wraps comes from
+            # an extension that isn't installed — rendering the raw preset
+            # fragment as a skill would emit broken output: a literal
+            # {CORE_TEMPLATE} for wrap, or only the preset's own fragment for
+            # prepend/append. Skip it here too so command mode and skills mode
+            # agree (mirrors _register_commands, which skips the same command).
+            # _register_commands already warned for this command in the same
+            # pass, so the skip is silent here to avoid a duplicate warning.
+            effective_strategy = (
+                cmd_tmpl.get("strategy")
+                or frontmatter.get("strategy")
+                or "replace"
+            )
+            if (
+                effective_strategy != "replace"
+                and not composed_file.exists()
+                and resolver.resolve_content(cmd_name, "command") is None
+            ):
+                continue
+
             if frontmatter.get("strategy") == "wrap":
                 body, core_frontmatter = _substitute_core_template(body, cmd_name, self.project_root, registrar)
                 frontmatter = dict(frontmatter)
-                for key in ("scripts", "agent_scripts"):
+                for key in ("scripts", "agent_scripts", "argument-hint"):
                     if key not in frontmatter and key in core_frontmatter:
                         frontmatter[key] = core_frontmatter[key]
 
@@ -2992,12 +3075,24 @@ class PresetManager:
         preset_dir: Union[Path, str],
         *,
         additional_owned_sources: Optional[Dict[str, str]] = None,
+        restore_from_bundled_core: bool = False,
     ) -> Dict[Path, tuple[Optional[str], List[str]]]:
         """Restore original SKILL.md files after a preset is removed.
 
         For each skill that was overridden by the preset, attempts to
         regenerate the skill from the core command template.  If no core
         template exists, the skill directory is removed.
+
+        Args:
+            restore_from_bundled_core: When True, a missing project-local
+                core template (the common case — ``specify init`` never
+                populates ``.specify/templates/commands``) falls back to
+                the bundled core_pack/repo-root templates so the skill is
+                restored instead of deleted (#3928). Callers that are
+                retiring a skill because its command now renders elsewhere
+                (a command file superseding it) must leave this False so
+                the skill is removed rather than resurrected with core
+                content that would duplicate the winning command.
 
         ``registered_skills`` records exactly which agent directories this
         preset actually wrote to (see :meth:`_register_skills`), so removal
@@ -3072,6 +3167,7 @@ class PresetManager:
                     renderer_agent,
                     pack_id=pack_id,
                     additional_owned_sources=additional_owned_sources,
+                    restore_from_bundled_core=restore_from_bundled_core,
                 )
                 if mutated_names:
                     restored[skills_dir] = (
@@ -3104,6 +3200,7 @@ class PresetManager:
             selected_ai,
             pack_id=pack_id,
             additional_owned_sources=additional_owned_sources,
+            restore_from_bundled_core=restore_from_bundled_core,
         )
         return (
             {skills_dir: (selected_ai, mutated_names)}
@@ -3169,6 +3266,30 @@ class PresetManager:
             if source in owned_sources:
                 shutil.rmtree(skill_subdir)
 
+    @staticmethod
+    def _warn_unrestored_skill(
+        skill_name: str, source_file: Path, exc: BaseException
+    ) -> None:
+        """Warn that a skill kept preset content because its restore source is unreadable.
+
+        Skipping the restore is the safe recovery — the alternative branch
+        deletes the skill outright — but it is still a partial removal: the
+        preset directory and registry entry go away while this ``SKILL.md``
+        keeps the removed preset's content, and reconciliation never revisits
+        it because the name is left out of ``mutated_names``. Name the skill
+        and the source so the condition is actionable instead of silent.
+        """
+        import warnings
+
+        warnings.warn(
+            f"Skill '{skill_name}' still contains the removed preset's content: "
+            f"its restore source '{source_file}' could not be read "
+            f"({exc.__class__.__name__}: {exc}). The skill was left in place "
+            f"rather than deleted. Fix or remove that file and re-run "
+            f"'specify preset add'/'specify preset remove' to refresh it.",
+            stacklevel=2,
+        )
+
     def _unregister_skills_in_dir(
         self,
         skill_names: List[str],
@@ -3177,6 +3298,7 @@ class PresetManager:
         *,
         pack_id: Optional[str] = None,
         additional_owned_sources: Optional[Dict[str, str]] = None,
+        restore_from_bundled_core: bool = False,
     ) -> List[str]:
         """Restore original SKILL.md files within a single skills directory.
 
@@ -3187,6 +3309,7 @@ class PresetManager:
                 placeholder resolution and argument-hint formatting.
             additional_owned_sources: Generated non-preset source markers
                 accepted as owned for specific skill names.
+            restore_from_bundled_core: See ``_unregister_skills``.
 
         Returns:
             Skill names whose files were restored or removed.
@@ -3262,14 +3385,51 @@ class PresetManager:
                 if current_source not in owned_sources:
                     continue
 
-            # Try to find the core command template
-            core_file = core_templates_dir / f"{short_name}.md" if core_templates_dir.exists() else None
-            if core_file and not core_file.exists():
+            extension_restore = extension_restore_index.get(skill_name)
+
+            # Try to find the core command template. Project-local overrides
+            # in core_templates_dir take precedence, but that directory is
+            # rarely populated — the real core commands ship in the bundled
+            # core_pack (wheel install) or the repo-root templates/ tree
+            # (source checkout). Callers that want a genuine restore (a
+            # preset was removed outright, not superseded by another
+            # renderer) opt into that fallback via restore_from_bundled_core
+            # so the skill is restored instead of deleted (#3928). An
+            # installed extension providing a core-named command resolves
+            # ahead of bundled core elsewhere, so skip the bundled fallback
+            # when an extension restore exists — otherwise it would win
+            # over the higher-priority extension layer below.
+            core_file = core_templates_dir / f"{short_name}.md"
+            if (
+                not core_file.exists()
+                and restore_from_bundled_core
+                and extension_restore is None
+            ):
+                from .. import _locate_core_pack, _repo_root
+
+                _core_pack = _locate_core_pack()
+                if _core_pack is not None:
+                    core_file = _core_pack / "commands" / f"{short_name}.md"
+                else:
+                    core_file = _repo_root() / "templates" / "commands" / f"{short_name}.md"
+            if not core_file.exists():
                 core_file = None
 
             if core_file:
-                # Restore from core template
-                content = core_file.read_text(encoding="utf-8")
+                # Restore from core template. An unreadable/undecodable
+                # source cannot produce restored content, so leave the
+                # existing skill untouched rather than leaking a raw
+                # OSError/UnicodeDecodeError out of `preset remove` — and
+                # rather than falling through to the rmtree below, which
+                # would delete a skill precisely when its replacement
+                # cannot be generated. Matches the `continue` guards above
+                # (unsafe name, missing subdir, foreign owner), which also
+                # skip without recording the name as mutated.
+                try:
+                    content = core_file.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError) as exc:
+                    self._warn_unrestored_skill(skill_name, core_file, exc)
+                    continue
                 frontmatter, body = registrar.parse_frontmatter(content)
                 if isinstance(selected_ai, str):
                     body = registrar.resolve_skill_placeholders(
@@ -3309,9 +3469,17 @@ class PresetManager:
                 mutated_names.append(skill_name)
                 continue
 
-            extension_restore = extension_restore_index.get(skill_name)
             if extension_restore:
-                content = extension_restore["source_file"].read_text(encoding="utf-8")
+                # Same boundary as the core-template branch above: an
+                # unreadable extension source leaves the skill in place
+                # instead of crashing or being deleted.
+                try:
+                    content = extension_restore["source_file"].read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError) as exc:
+                    self._warn_unrestored_skill(
+                        skill_name, extension_restore["source_file"], exc
+                    )
+                    continue
                 frontmatter, body = registrar.parse_frontmatter(content)
                 # Mirror the register-time rewrite (#2101): resolve
                 # extension-relative subdir references (agents/,
@@ -3448,7 +3616,9 @@ class PresetManager:
                 "registered_skills", registered_skills
             )
             if persisted_skills:
-                self._unregister_skills(persisted_skills, dest_dir)
+                self._unregister_skills(
+                    persisted_skills, dest_dir, restore_from_bundled_core=True
+                )
             try:
                 if dest_dir.exists():
                     shutil.rmtree(dest_dir)
@@ -3476,13 +3646,10 @@ class PresetManager:
                     stacklevel=2,
                 )
 
-        # Seed/re-seed memory/constitution.md from a preset-provided
-        # constitution-template. The constitution is the only template that is
-        # materialized to a live file rather than resolved on demand, so a
-        # preset that ships one (e.g. strategy: replace with a ratified
-        # constitution) must be propagated here. Guard against clobbering an
-        # already-authored constitution by only replacing a file whose recorded
-        # hash (or exact legacy core-template content) proves it was generated.
+        # Materialize constitution-template changes only for projects that opt
+        # into the constitution-sync preset. The core /constitution command
+        # resolves this template on demand; constitution-sync preserves the
+        # previous install-time behavior for teams that want reviewed snapshots.
         self._seed_constitution_from_preset(manifest, dest_dir)
 
         return manifest
@@ -3490,14 +3657,13 @@ class PresetManager:
     def _seed_constitution_from_preset(
         self, manifest: PresetManifest, preset_dir: Path
     ) -> None:
-        """Seed memory/constitution.md from a preset constitution-template.
+        """Seed memory/constitution.md when constitution-sync opts into snapshots.
 
-        Only runs when the preset declares a ``type: template`` entry named
-        ``constitution-template`` or provides one at a convention path, and the
-        live memory file is either missing or is an unchanged generated file.
-        Authored constitutions are never overwritten.
+        Installing constitution-sync itself materializes the currently resolved
+        stack. Later preset installs only reconcile when they provide a
+        ``constitution-template``. Authored constitutions are never overwritten.
         """
-        provides_constitution = any(
+        provides_constitution = manifest.id == _CONSTITUTION_SYNC_PRESET_ID or any(
             t.get("type") == "template" and t.get("name") == "constitution-template"
             for t in manifest.templates
         ) or any(
@@ -3518,7 +3684,7 @@ class PresetManager:
     def reconcile_constitution(
         self, failure_context: str, *, create_if_missing: bool = False
     ) -> None:
-        """Reconcile generated constitution content without failing a persisted change."""
+        """Reconcile an opted-in generated constitution without failing a change."""
         try:
             self._reconcile_constitution(create_if_missing=create_if_missing)
         except (OSError, UnicodeDecodeError, PresetValidationError, ValueError) as exc:
@@ -3530,7 +3696,11 @@ class PresetManager:
             )
 
     def _reconcile_constitution(self, *, create_if_missing: bool = False) -> None:
-        """Materialize the winning constitution layer when the live file is generated."""
+        """Materialize the winning layer when constitution-sync is enabled."""
+        sync_metadata = self.registry.get(_CONSTITUTION_SYNC_PRESET_ID)
+        if sync_metadata is None or not sync_metadata.get("enabled", True):
+            return
+
         memory_constitution = (
             self.project_root / ".specify" / "memory" / "constitution.md"
         )
@@ -3786,6 +3956,7 @@ class PresetManager:
                 restorable_skills,
                 pack_dir,
                 additional_owned_sources=override_sources,
+                restore_from_bundled_core=True,
             )
             try:
                 from ..agents import CommandRegistrar
@@ -4835,6 +5006,18 @@ class PresetResolver:
                 self._manifest_cache[key] = None
         return self._manifest_cache[key]
 
+    @staticmethod
+    def _is_safe_registry_id(value: object) -> bool:
+        return isinstance(value, str) and re.fullmatch(r"[a-z0-9-]+", value) is not None
+
+    def _get_all_presets_by_priority(self) -> List[tuple[str, dict]]:
+        registry = PresetRegistry(self.presets_dir)
+        return [
+            (pack_id, metadata)
+            for pack_id, metadata in registry.list_by_priority()
+            if self._is_safe_registry_id(pack_id)
+        ]
+
     def _manifest_declared_template(
         self, pack_dir: Path, template_name: str, template_type: str
     ) -> tuple[dict | None, Path | None]:
@@ -4868,6 +5051,64 @@ class PresetResolver:
                 return tmpl, None
         return None, None
 
+    def _extension_manifest_declared_template(
+        self, ext_dir: Path, template_name: str, template_type: str
+    ) -> tuple[dict | None, Path | None]:
+        """Resolve an extension's manifest-declared command/template/script entry and usable file.
+
+        Mirrors ``_manifest_declared_template`` (for presets): returns ``(entry, candidate)``
+        where ``entry`` is the matching ``provides.<type>`` mapping, or ``None`` if the
+        extension has no (valid) manifest or doesn't declare this ``(name, type)``.
+        ``candidate`` is the declared ``file:`` resolved under ``ext_dir`` IFF it is a
+        regular file that stays within ``ext_dir`` (guards against path traversal via a
+        malformed manifest, mirroring ``resolve_extension_command_via_manifest``);
+        ``None`` otherwise.
+
+        The manifest is authoritative: when ``entry`` is not ``None`` but ``candidate`` is
+        ``None``, callers must NOT fall back to convention-based lookup — that would mask
+        a typo or pick up an undeclared file. Shared by ``resolve()`` and
+        ``collect_all_layers()`` so their manifest-first resolution cannot silently
+        diverge (the divergence flagged in review on #4012).
+        """
+        if template_type not in ("command", "template", "script"):
+            return None, None
+        ext_manifest_path = ext_dir / "extension.yml"
+        if not ext_manifest_path.exists():
+            return None, None
+        from ..extensions import ExtensionManifest, ValidationError as ExtValidationError
+
+        try:
+            ext_manifest = ExtensionManifest(ext_manifest_path)
+        except (ExtValidationError, yaml.YAMLError, OSError, TypeError, AttributeError):
+            return None, None
+        if template_type == "command":
+            entries = ext_manifest.commands
+        elif template_type == "template":
+            entries = ext_manifest.templates
+        else:
+            entries = ext_manifest.scripts
+        for entry in entries:
+            if entry.get("name") != template_name:
+                continue
+            file_rel = entry.get("file")
+            if not file_rel:
+                return entry, None
+            rel_path = Path(file_rel)
+            if rel_path.is_absolute():
+                return entry, None
+            candidate = ext_dir / rel_path
+            try:
+                # Resolve only for the containment check, not for the
+                # returned path -- resolving the returned path would follow
+                # symlinks in ext_dir's ancestors (e.g. a symlinked tmp dir
+                # on macOS) and diverge from the unresolved paths convention
+                # lookup returns for the same directory.
+                candidate.resolve().relative_to(ext_dir.resolve())  # raises ValueError if outside
+            except (OSError, ValueError):
+                return entry, None
+            return entry, (candidate if candidate.is_file() else None)
+        return None, None
+
     def _get_all_extensions_by_priority(self) -> list[tuple[int, str, dict | None]]:
         """Build unified list of registered and unregistered extensions sorted by priority.
 
@@ -4882,6 +5123,16 @@ class PresetResolver:
             return []
 
         registry = ExtensionRegistry(self.extensions_dir)
+        # Fail closed on a corrupt registry. ExtensionRegistry._load() recovers
+        # by normalizing an unreadable registry to an empty mapping, which would
+        # otherwise cause the directory scan below to admit every on-disk
+        # directory as an unregistered, enabled extension — a fail-open path
+        # that could supply constitution content from an invalid registry state.
+        if registry.is_corrupt():
+            raise PresetValidationError(
+                f"Invalid extension registry {registry.registry_path}: "
+                "refusing to enumerate extensions"
+            )
         # Use keys() to track ALL extensions (including corrupted entries) without deep copy
         # This prevents corrupted entries from being picked up as "unregistered" dirs
         registered_extension_ids = registry.keys()
@@ -4893,6 +5144,8 @@ class PresetResolver:
 
         # Only include enabled extensions in the result
         for ext_id, metadata in all_registered:
+            if not self._is_safe_registry_id(ext_id):
+                continue
             # Skip disabled extensions
             if not metadata.get("enabled", True):
                 continue
@@ -4901,7 +5154,7 @@ class PresetResolver:
 
         # Add unregistered directories with implicit priority=10
         for ext_dir in self.extensions_dir.iterdir():
-            if not ext_dir.is_dir() or ext_dir.name.startswith("."):
+            if not ext_dir.is_dir() or not self._is_safe_registry_id(ext_dir.name):
                 continue
             if ext_dir.name not in registered_extension_ids:
                 all_extensions.append((10, ext_dir.name, None))
@@ -4967,8 +5220,7 @@ class PresetResolver:
 
         # Priority 2: Installed presets (sorted by priority — lower number wins)
         if not skip_presets and self.presets_dir.exists():
-            registry = PresetRegistry(self.presets_dir)
-            for pack_id, _metadata in registry.list_by_priority():
+            for pack_id, _metadata in self._get_all_presets_by_priority():
                 pack_dir = self.presets_dir / pack_id
                 # The preset manifest is authoritative: if it declares this
                 # template with an explicit ``file:``, resolve to that path —
@@ -5003,6 +5255,16 @@ class PresetResolver:
         for _priority, ext_id, _metadata in self._get_all_extensions_by_priority():
             ext_dir = self.extensions_dir / ext_id
             if not ext_dir.is_dir():
+                continue
+            # The extension manifest is authoritative, same as preset manifests
+            # above: check it before convention-based lookup so a declared entry
+            # at a non-conventional path wins over a stale conventional file.
+            entry, manifest_candidate = self._extension_manifest_declared_template(
+                ext_dir, template_name, template_type
+            )
+            if manifest_candidate is not None:
+                return manifest_candidate
+            if entry is not None:
                 continue
             for subdir in subdirs:
                 if subdir:
@@ -5161,13 +5423,11 @@ class PresetResolver:
             return {"path": resolved_str, "source": "project override"}
 
         if str(self.presets_dir) in resolved_str and self.presets_dir.exists():
-            registry = PresetRegistry(self.presets_dir)
-            for pack_id, _metadata in registry.list_by_priority():
+            for pack_id, metadata in self._get_all_presets_by_priority():
                 pack_dir = self.presets_dir / pack_id
                 try:
                     resolved.relative_to(pack_dir)
-                    meta = registry.get(pack_id)
-                    version = meta.get("version", "?") if meta else "?"
+                    version = metadata.get("version", "?")
                     return {
                         "path": resolved_str,
                         "source": f"{pack_id} v{version}",
@@ -5253,8 +5513,7 @@ class PresetResolver:
 
         # Priority 2: Installed presets (sorted by priority — lower number = higher precedence)
         if self.presets_dir.exists():
-            registry = PresetRegistry(self.presets_dir)
-            for pack_id, metadata in registry.list_by_priority():
+            for pack_id, metadata in self._get_all_presets_by_priority():
                 pack_dir = self.presets_dir / pack_id
                 # Read strategy and manifest file path from preset manifest
                 strategy = "replace"
@@ -5297,7 +5556,7 @@ class PresetResolver:
                                         fm_strategy = fm_data.get("strategy")
                                         if isinstance(fm_strategy, str) and fm_strategy.lower() in VALID_PRESET_STRATEGIES:
                                             strategy = fm_strategy.lower()
-                        except (yaml.YAMLError, OSError):
+                        except (UnicodeDecodeError, yaml.YAMLError, OSError):
                             # Best-effort legacy frontmatter parsing: keep default
                             # strategy ("replace") when content is unreadable/invalid.
                             pass
@@ -5313,27 +5572,15 @@ class PresetResolver:
             ext_dir = self.extensions_dir / ext_id
             if not ext_dir.is_dir():
                 continue
-            # Try convention-based lookup first
-            candidate = _find_in_subdirs(ext_dir)
-            # If not found and this is a command, check extension manifest
-            if candidate is None and template_type == "command":
-                ext_manifest_path = ext_dir / "extension.yml"
-                if ext_manifest_path.exists():
-                    try:
-                        from ..extensions import ExtensionManifest, ValidationError as ExtValidationError
-                        ext_manifest = ExtensionManifest(ext_manifest_path)
-                        for cmd in ext_manifest.commands:
-                            if cmd.get("name") == template_name:
-                                cmd_file = cmd.get("file")
-                                if cmd_file:
-                                    c = ext_dir / cmd_file
-                                    if c.exists():
-                                        candidate = c
-                                break
-                    except (ExtValidationError, yaml.YAMLError):
-                        # Invalid extension manifest — fall back to
-                        # convention-based lookup (already attempted above).
-                        pass
+            # The extension manifest is authoritative, same as preset manifests
+            # above: check it before convention-based lookup so a declared entry
+            # at a non-conventional path wins over a stale conventional file, and
+            # a declared-but-missing file isn't silently masked by convention.
+            entry, candidate = self._extension_manifest_declared_template(
+                ext_dir, template_name, template_type
+            )
+            if entry is None:
+                candidate = _find_in_subdirs(ext_dir)
             if candidate:
                 if ext_meta:
                     version = ext_meta.get("version", "?")
@@ -5465,7 +5712,7 @@ class PresetResolver:
         if not layers:
             return None
 
-        def _read_layer_content(layer: Dict[str, Any]) -> str:
+        def _read_layer_content(layer: Dict[str, Any]) -> Optional[str]:
             """Read a layer's raw text, rewriting extension-relative subdir
             references (agents/, knowledge-base/, etc.) to their installed
             location when the layer is extension-provided (#2101).
@@ -5475,8 +5722,18 @@ class PresetResolver:
             rewrite when it wins outright above or serves as the
             composition base below — never as a mid-stack composing
             (append/prepend/wrap) layer.
+
+            Returns None when the layer cannot be read or decoded:
+            collect_all_layers deliberately keeps a non-UTF-8 legacy layer
+            (with its "replace" default) so unrelated commands still
+            resolve, so the same tolerance must apply here — the documented
+            contract is "Composed content string, or None if not found",
+            not a raw UnicodeDecodeError at composition time.
             """
-            text = layer["path"].read_text(encoding="utf-8")
+            try:
+                text = layer["path"].read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                return None
             extension_id = layer.get("extension_id")
             extension_dir = layer.get("extension_dir")
             if extension_id and extension_dir:
@@ -5514,6 +5771,8 @@ class PresetResolver:
         # Convert to reversed_layers index
         base_reversed_idx = len(layers) - 1 - base_layer_idx
         content = _read_layer_content(layers[base_layer_idx])
+        if content is None:
+            return None
         # Compose only the layers above the base (higher priority = lower index in layers,
         # higher index in reversed_layers). Process bottom-up from base+1.
         start_idx = base_reversed_idx + 1
@@ -5557,7 +5816,12 @@ class PresetResolver:
 
         # Apply composition layers from bottom to top
         for layer in reversed_layers[start_idx:]:
-            layer_content = layer["path"].read_text(encoding="utf-8")
+            try:
+                layer_content = layer["path"].read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                # Same tolerance as _read_layer_content: an unreadable layer
+                # means the composed result cannot be produced.
+                return None
             strategy = layer["strategy"]
 
             if is_command:
@@ -5614,7 +5878,7 @@ class PresetResolver:
             # Inherit scripts/agent_scripts from base frontmatter if missing
             if base_frontmatter_text and base_frontmatter_text != top_frontmatter_text:
                 base_fm = _parse_fm_yaml(base_frontmatter_text)
-                for key in ("scripts", "agent_scripts"):
+                for key in ("scripts", "agent_scripts", "argument-hint"):
                     if key not in top_fm and key in base_fm:
                         top_fm[key] = base_fm[key]
 

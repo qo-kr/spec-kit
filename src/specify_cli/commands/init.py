@@ -3,19 +3,22 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
 import typer
 from rich.live import Live
+from rich.markup import escape as _escape_markup
 from rich.panel import Panel
 
 from .._agent_config import (
     AGENT_CONFIG,
-    DEFAULT_INIT_INTEGRATION,
     SCRIPT_TYPE_CHOICES,
+    resolve_default_init_integration,
 )
 from .._assets import (
     _locate_bundled_preset,
@@ -30,6 +33,16 @@ def _stdin_is_interactive() -> bool:
     return sys.stdin.isatty()
 
 
+def _prompts_allowed(non_interactive: bool) -> bool:
+    """Return True when interactive pickers and confirmations may be shown.
+
+    ``--non-interactive`` suppresses prompts even when stdin is a TTY. Agent
+    harnesses often allocate a PTY (so ``isatty()`` is True) but cannot send
+    arrow-key input, which previously hung in ``select_with_arrows``.
+    """
+    return not non_interactive and _stdin_is_interactive()
+
+
 def _ext_spec_is_url(ext_spec: str) -> bool:
     """Return True when *ext_spec* is an http(s) URL rather than a name/path."""
     from urllib.parse import urlparse
@@ -41,7 +54,10 @@ def _ext_spec_is_url(ext_spec: str) -> bool:
 
 
 def _confirm_extension_url_trust(
-    url_specs: list[str], *, trust_override: bool
+    url_specs: list[str],
+    *,
+    trust_override: bool,
+    allow_prompt: bool | None = None,
 ) -> dict[str, bool]:
     """Resolve trust for each URL-based extension before the Live display.
 
@@ -55,7 +71,7 @@ def _confirm_extension_url_trust(
     from rich.panel import Panel
 
     approvals: dict[str, bool] = {}
-    interactive = _stdin_is_interactive()
+    interactive = _stdin_is_interactive() if allow_prompt is None else allow_prompt
     for spec in url_specs:
         if trust_override:
             approvals[spec] = True
@@ -169,6 +185,25 @@ def _install_extension_during_init(project_path: Path, ext_spec: str, speckit_ve
     return f"{manifest.name} v{manifest.version} installed"
 
 
+def _shell_quote_arg(value: str) -> str:
+    """Quote *value* as one argument for the shells of the host OS.
+
+    The Next Steps ``cd`` line is copy-pasted into whichever shell ran
+    ``specify init``, so it is quoted for the host the same way
+    ``_version._render_argv`` renders its copy-pasteable installer command:
+    ``list2cmdline`` on Windows, ``shlex.quote`` elsewhere. The Windows branch
+    must emit double quotes -- ``cd 'my project'`` is a path-not-found in
+    cmd.exe, while ``cd "my project"`` is accepted by cmd.exe, PowerShell and
+    Git Bash alike. A value needing no quoting is returned unchanged.
+
+    Whitespace only. PowerShell also glob-expands ``[``/``]`` and expands
+    ``$``/backtick inside double quotes, so such a name still needs
+    ``Set-Location -LiteralPath`` there -- syntax invalid in cmd.exe and sh, so
+    this shell-neutral line cannot cover it.
+    """
+    return subprocess.list2cmdline([value]) if os.name == "nt" else shlex.quote(value)
+
+
 def ensure_constitution_from_template(
     project_path: Path, tracker: StepTracker | None = None
 ) -> None:
@@ -242,6 +277,16 @@ def register(app: typer.Typer) -> None:
             "--force",
             help="Force merge/overwrite when using --here (skip confirmation)",
         ),
+        non_interactive: bool = typer.Option(
+            False,
+            "--non-interactive",
+            help=(
+                "Never prompt. Use documented defaults for unspecified "
+                "selections and fail instead of hanging when a choice has no "
+                "safe default. Required for agent harnesses that allocate a "
+                "PTY but cannot send arrow-key input."
+            ),
+        ),
         skip_tls: bool = typer.Option(
             False,
             "--skip-tls",
@@ -302,7 +347,7 @@ def register(app: typer.Typer) -> None:
         This command will:
         1. Check that required tools are installed
         2. Let you choose your coding agent integration, or default to Copilot
-           in non-interactive sessions
+           in non-interactive sessions (no TTY, or --non-interactive)
         3. Install bundled Spec Kit templates, scripts, workflow, and shared
            project infrastructure
         4. Set up coding agent integration commands and optional presets
@@ -319,6 +364,8 @@ def register(app: typer.Typer) -> None:
             specify init --here --integration vibe      # Initialize with Mistral Vibe support
             specify init --here
             specify init --here --force  # Skip confirmation when current directory not empty
+            specify init my-project --non-interactive  # CI/agent: defaults, no prompts
+            specify init --here --force --non-interactive --integration claude  # Scripted init, no hang
             specify init my-project --integration claude   # Claude installs skills by default
             specify init --here --integration gemini
             specify init my-project --integration generic --integration-options="--commands-dir .myagent/commands/"  # Bring your own agent; requires --commands-dir
@@ -351,7 +398,10 @@ def register(app: typer.Typer) -> None:
         if integration:
             resolved_integration = get_integration(integration)
             if not resolved_integration:
-                console.print(f"[red]Error:[/red] Unknown integration: '{integration}'")
+                console.print(
+                    f"[red]Error:[/red] Unknown integration: "
+                    f"'{_escape_markup(str(integration))}'"
+                )
                 available = ", ".join(sorted(INTEGRATION_REGISTRY))
                 console.print(f"[yellow]Available integrations:[/yellow] {available}")
                 raise typer.Exit(1)
@@ -391,6 +441,13 @@ def register(app: typer.Typer) -> None:
                     console.print(
                         "[cyan]--force supplied: skipping confirmation and proceeding with merge[/cyan]"
                     )
+                elif non_interactive:
+                    console.print(
+                        "[red]Error:[/red] Current directory is not empty and "
+                        "--non-interactive was set. Re-run with "
+                        "[bold]--force[/bold] to merge into it."
+                    )
+                    raise typer.Exit(1)
                 else:
                     # Fold the merge risk into the confirmation prompt rather than
                     # printing it unconditionally first: on the EOF/no-input path
@@ -428,26 +485,27 @@ def register(app: typer.Typer) -> None:
             project_path = Path(project_name).resolve()
             dir_existed_before = project_path.exists()
             if project_path.exists():
+                safe_name = _escape_markup(str(project_name))
                 if not project_path.is_dir():
                     console.print(
-                        f"[red]Error:[/red] '{project_name}' exists but is not a directory."
+                        f"[red]Error:[/red] '{safe_name}' exists but is not a directory."
                     )
                     raise typer.Exit(1)
                 existing_items = list(project_path.iterdir())
                 if force:
                     if existing_items:
                         console.print(
-                            f"[yellow]Warning:[/yellow] Directory '{project_name}' is not empty ({len(existing_items)} items)"
+                            f"[yellow]Warning:[/yellow] Directory '{safe_name}' is not empty ({len(existing_items)} items)"
                         )
                         console.print(
                             "[yellow]Template files will be merged with existing content and may overwrite existing files[/yellow]"
                         )
                     console.print(
-                        f"[cyan]--force supplied: merging into existing directory '[cyan]{project_name}[/cyan]'[/cyan]"
+                        f"[cyan]--force supplied: merging into existing directory '[cyan]{safe_name}[/cyan]'[/cyan]"
                     )
                 else:
                     error_panel = Panel(
-                        f"Directory already exists: '[cyan]{project_name}[/cyan]'\n"
+                        f"Directory already exists: '[cyan]{safe_name}[/cyan]'\n"
                         "Please choose a different project name or remove the existing directory.\n"
                         "Use [bold]--force[/bold] to merge into the existing directory.",
                         title="[red]Directory Conflict[/red]",
@@ -461,22 +519,24 @@ def register(app: typer.Typer) -> None:
         if integration:
             if integration not in AGENT_CONFIG:
                 console.print(
-                    f"[red]Error:[/red] Invalid integration '{integration}'. Choose from: {', '.join(AGENT_CONFIG.keys())}"
+                    f"[red]Error:[/red] Invalid integration '{_escape_markup(str(integration))}'. Choose from: {', '.join(AGENT_CONFIG.keys())}"
                 )
                 raise typer.Exit(1)
             selected_ai = integration
-        elif not _stdin_is_interactive():
+        elif not _prompts_allowed(non_interactive):
+            default_integration = resolve_default_init_integration()
             console.print(
-                f"[dim]Non-interactive session detected: defaulting to '{DEFAULT_INIT_INTEGRATION}'. "
+                f"[dim]Non-interactive session detected: defaulting to '{default_integration}'. "
                 "Use --integration to choose a different agent.[/dim]"
             )
-            selected_ai = DEFAULT_INIT_INTEGRATION
+            selected_ai = default_integration
         else:
             ai_choices = {key: config["name"] for key, config in AGENT_CONFIG.items()}
             selected_ai = select_with_arrows(
                 ai_choices,
                 "Choose your coding agent integration:",
-                DEFAULT_INIT_INTEGRATION,
+                resolve_default_init_integration(),
+                flag_hint="--integration <agent>",
             )
 
         if not integration:
@@ -499,12 +559,14 @@ def register(app: typer.Typer) -> None:
         setup_lines = [
             "[cyan]Specify Project Setup[/cyan]",
             "",
-            f"{'Project':<15} [green]{project_path.name}[/green]",
-            f"{'Working Path':<15} [dim]{current_dir}[/dim]",
+            f"{'Project':<15} [green]{_escape_markup(project_path.name)}[/green]",
+            f"{'Working Path':<15} [dim]{_escape_markup(str(current_dir))}[/dim]",
         ]
 
         if not here:
-            setup_lines.append(f"{'Target Path':<15} [dim]{project_path}[/dim]")
+            setup_lines.append(
+                f"{'Target Path':<15} [dim]{_escape_markup(str(project_path))}[/dim]"
+            )
 
         console.print(
             Panel("\n".join(setup_lines), border_style="cyan", padding=(1, 2))
@@ -531,18 +593,19 @@ def register(app: typer.Typer) -> None:
         if script_type:
             if script_type not in SCRIPT_TYPE_CHOICES:
                 console.print(
-                    f"[red]Error:[/red] Invalid script type '{script_type}'. Choose from: {', '.join(SCRIPT_TYPE_CHOICES.keys())}"
+                    f"[red]Error:[/red] Invalid script type '{_escape_markup(str(script_type))}'. Choose from: {', '.join(SCRIPT_TYPE_CHOICES.keys())}"
                 )
                 raise typer.Exit(1)
             selected_script = script_type
         else:
             default_script = "ps" if os.name == "nt" else "sh"
 
-            if _stdin_is_interactive():
+            if _prompts_allowed(non_interactive):
                 selected_script = select_with_arrows(
                     SCRIPT_TYPE_CHOICES,
                     "Choose script type (or press Enter)",
                     default_script,
+                    flag_hint="--script sh|ps|py",
                 )
             else:
                 selected_script = default_script
@@ -570,8 +633,6 @@ def register(app: typer.Typer) -> None:
             tracker.add(key, label)
 
         if extensions:
-            from rich.markup import escape as _escape_markup
-
             for i, ext_spec in enumerate(extensions):
                 tracker.add(
                     f"extension-{i}", f"Install extension: {_escape_markup(ext_spec)}"
@@ -588,7 +649,9 @@ def register(app: typer.Typer) -> None:
             url_specs = [e for e in extensions if _ext_spec_is_url(e)]
             if url_specs:
                 extension_url_approvals = _confirm_extension_url_trust(
-                    url_specs, trust_override=trust_extension_urls
+                    url_specs,
+                    trust_override=trust_extension_urls,
+                    allow_prompt=_prompts_allowed(non_interactive),
                 )
 
         # Disable transient mode on Windows: PowerShell 5.1's legacy console
@@ -633,6 +696,30 @@ def register(app: typer.Typer) -> None:
                     events=events_map,
                 )
                 manifest.save()
+
+                if force:
+                    from ..integrations._helpers import (
+                        _register_extensions_for_agent,
+                        _register_presets_for_agent,
+                    )
+
+                    _register_extensions_for_agent(
+                        project_path,
+                        resolved_integration.key,
+                        force=True,
+                        continuing=(
+                            "The project was re-initialized, but installed extensions"
+                            " may need re-registration."
+                        ),
+                    )
+                    _register_presets_for_agent(
+                        project_path,
+                        resolved_integration.key,
+                        continuing=(
+                            "The project was re-initialized, but installed presets"
+                            " may need re-registration."
+                        ),
+                    )
 
                 integration_settings = _with_integration_setting(
                     {},
@@ -802,8 +889,6 @@ def register(app: typer.Typer) -> None:
 
                 # Install extensions specified via --extension
                 if extensions:
-                    from rich.markup import escape as _escape_markup
-
                     from ..extensions._commands import _refresh_events_and_warn
 
                     speckit_ver = get_speckit_version()
@@ -893,7 +978,7 @@ def register(app: typer.Typer) -> None:
             if agent_folder:
                 security_notice = Panel(
                     f"Some agents may store credentials, auth tokens, or other identifying and private artifacts in the agent folder within your project.\n"
-                    f"Consider adding [cyan]{agent_folder}[/cyan] (or parts of it) to [cyan].gitignore[/cyan] to prevent accidental credential leakage.",
+                    f"Consider adding [cyan]{_escape_markup(str(agent_folder))}[/cyan] (or parts of it) to [cyan].gitignore[/cyan] to prevent accidental credential leakage.",
                     title="[yellow]Agent Folder Security[/yellow]",
                     border_style="yellow",
                     padding=(1, 2),
@@ -904,7 +989,7 @@ def register(app: typer.Typer) -> None:
         steps_lines = []
         if not here:
             steps_lines.append(
-                f"1. Go to the project folder: [cyan]cd {project_name}[/cyan]"
+                f"1. Go to the project folder: [cyan]cd {_escape_markup(_shell_quote_arg(str(project_name)))}[/cyan]"
             )
             step_num = 2
         else:

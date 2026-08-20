@@ -157,7 +157,11 @@ class CommandRegistrar:
             return ""
 
         yaml_str = yaml.dump(
-            fm, default_flow_style=False, sort_keys=False, allow_unicode=True
+            fm,
+            default_flow_style=False,
+            sort_keys=False,
+            allow_unicode=True,
+            width=float("inf"),
         )
         return f"---\n{yaml_str}---\n"
 
@@ -679,7 +683,7 @@ class CommandRegistrar:
             _integ = get_integration(agent_name)
             if _integ is not None:
                 _sep = _integ.invoke_separator_for_mode(registrar_writes_skills)
-        except Exception:
+        except (ImportError, ValueError, KeyError):
             pass
         _prefix = get_invocation_prefix(agent_name, registrar_writes_skills)
 

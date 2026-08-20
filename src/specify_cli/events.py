@@ -17,7 +17,7 @@ import shutil
 import sys
 import subprocess
 import platform
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, Any
 
 import yaml
@@ -29,6 +29,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # -- Constants -------------------------------------------------------------
+
+# Generated hook dispatchers refuse to delegate unless this name is True.
+# An older installed specify_cli.events (uvx-init plus a stale global
+# install) would otherwise run unconfined script tokens.
+EVENT_SCRIPT_PATH_CONFINEMENT = True
 
 EVENTS_DISPATCHER_DIR = Path(".specify")
 EVENTS_DISPATCHER_FILENAME = "events.py"
@@ -83,7 +88,22 @@ import shlex
 import shutil
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
+
+
+def _script_under_base(base, token, project_root):
+    """Return token resolved under base, or None if it leaves the project."""
+    posix_path = PurePosixPath(token)
+    win_path = PureWindowsPath(token)
+    if posix_path.anchor or win_path.anchor:
+        return None
+    try:
+        root = project_root.resolve()
+        candidate = (base / token).resolve()
+        candidate.relative_to(root)
+    except (OSError, ValueError):
+        return None
+    return candidate
 
 
 def _find_command_template(command_name, project_root):
@@ -228,8 +248,8 @@ def _resolve_argv(template_path, project_root, ext_id):
         return None
     if not tokens:
         return None
-    script_abs = base / tokens[0]
-    if not script_abs.exists():
+    script_abs = _script_under_base(base, tokens[0], project_root)
+    if script_abs is None or not script_abs.exists():
         return None
     rest = tokens[1:]
 
@@ -251,7 +271,7 @@ def _resolve_argv(template_path, project_root, ext_id):
     return [str(script_abs), *rest]
 
 
-def _run_inline(command_name, payload, project_root, timeout):
+def _run_inline(command_name, payload, project_root, timeout, envelope="plain", native_event=""):
     """Resolve and run the event command with stdlib only (no specify_cli)."""
     template_path, ext_id = _find_command_template(command_name, project_root)
     if not template_path:
@@ -269,7 +289,7 @@ def _run_inline(command_name, payload, project_root, timeout):
             cwd=str(project_root),
         )
         if result.stdout:
-            sys.stdout.write(result.stdout)
+            _emit(result.stdout, envelope, native_event)
         if result.returncode != 0:
             if result.stderr:
                 sys.stderr.write(result.stderr)
@@ -281,6 +301,53 @@ def _run_inline(command_name, payload, project_root, timeout):
     except Exception as e:
         print(f"Event {command_name} error: {e}", file=sys.stderr)
         return 2
+
+
+def _emit(output, envelope, native_event=""):
+    """Write handler output to stdout in the agent's context-injection shape.
+
+    Not every agent injects a hook's plain-text stdout as model context:
+    Gemini/Tabnine/Qwen/Devin are JSON-only protocols (plain text becomes
+    user-facing noise, never context), Copilot discards non-JSON stdout, and
+    Cursor parses stdout as JSON. The native hook command passes the envelope
+    as the dispatcher's 5th argument (see events_context_envelope on the
+    integration classes), and the native event name as the 6th argument so
+    hookSpecificOutput can include hookEventName:
+
+      hookSpecificOutput → {"hookSpecificOutput": {"hookEventName": ..., "additionalContext": ...}}
+      additionalContext  → {"additionalContext": ...}   (top-level, Copilot)
+      additional_context → {"additional_context": ...}  (top-level, Cursor)
+      hook_specific_output → {"decision": "allow", "hook_specific_output":
+                           {"additional_context": ...}} (Vibe: any non-empty
+                           stdout must parse as a HookStructuredResponse or
+                           the hook is reported failed and output dropped)
+      suppress           → emit nothing (strict-JSON agents on events whose
+                           output can't be used)
+      plain (default)    → passthrough (Claude/Codex inject plain stdout)
+
+    Empty output emits nothing under any envelope (an empty additionalContext
+    is useless noise).
+    """
+    if not output:
+        return
+    if envelope == "suppress":
+        return
+    if envelope == "hookSpecificOutput":
+        payload = {"additionalContext": output}
+        if native_event:
+            payload["hookEventName"] = native_event
+        sys.stdout.write(json.dumps({"hookSpecificOutput": payload}) + "\\n")
+        return
+    if envelope == "additionalContext":
+        sys.stdout.write(json.dumps({"additionalContext": output}) + "\\n")
+        return
+    if envelope == "additional_context":
+        sys.stdout.write(json.dumps({"additional_context": output}) + "\\n")
+        return
+    if envelope == "hook_specific_output":
+        sys.stdout.write(json.dumps({"decision": "allow", "hook_specific_output": {"additional_context": output}}) + "\\n")
+        return
+    sys.stdout.write(output)
 
 
 def main():
@@ -297,24 +364,42 @@ def main():
             timeout = int(sys.argv[3])
         except (TypeError, ValueError):
             timeout = 120
+    # Optional 5th arg: context-injection envelope for stdout (C13): plain
+    # (default), hookSpecificOutput, additionalContext, additional_context,
+    # hook_specific_output, or suppress. Unknown values fall back to plain
+    # passthrough.
+    envelope = sys.argv[4] if len(sys.argv) >= 5 else "plain"
+    if envelope not in ("plain", "hookSpecificOutput", "additionalContext", "additional_context", "hook_specific_output", "suppress"):
+        envelope = "plain"
+    # Optional 6th arg: native event name for hookSpecificOutput's
+    # hookEventName field (required by Qwen's hooks spec; included by
+    # Gemini/Tabnine/Devin which derive from the same protocol).
+    native_event = sys.argv[5] if len(sys.argv) >= 6 else ""
     payload = sys.stdin.read() if not sys.stdin.isatty() else "{}"
     project_root = Path(__file__).parent.parent.resolve()
 
     # Preferred path: specify_cli is importable (durable install) — delegate to
     # the full resolver, which also handles extension manifests whose file stem
     # differs from the command name and the project's custom script selection.
+    # Require EVENT_SCRIPT_PATH_CONFINEMENT so a stale global install cannot
+    # bypass the generated dispatcher's path guard.
     try:
-        from specify_cli.events import resolve_and_run_event_command
+        from specify_cli.events import (
+            EVENT_SCRIPT_PATH_CONFINEMENT as _confine_ok,
+            resolve_and_run_event_command,
+        )
+        if _confine_ok is not True:
+            raise ImportError("specify_cli.events lacks script path confinement")
         sys.exit(
             resolve_and_run_event_command(
-                command_name, _event_name, payload, project_root, timeout=timeout
+                command_name, _event_name, payload, project_root, timeout=timeout, envelope=envelope, native_event=native_event
             )
         )
-    except ImportError:
+    except (ImportError, TypeError):
         pass
 
     # Fallback: self-contained stdlib resolver (one-time/temporary installs).
-    sys.exit(_run_inline(command_name, payload, project_root, timeout))
+    sys.exit(_run_inline(command_name, payload, project_root, timeout, envelope, native_event))
 
 
 if __name__ == "__main__":
@@ -362,17 +447,21 @@ function resolveDispatcher(directory: string): void {{
   ) as string;
 }}
 
-function runEvent(command: string, event: string, input: any, output: any, timeoutSec: number): void {{
-  if (!DISPATCHER) return;
+function runEvent(command: string, event: string, input: any, output: any, timeoutSec: number): string {{
+  if (!DISPATCHER) return '';
   try {{
     // execFileSync with an argv array invokes the interpreter directly — no
     // shell — so command/event strings with metacharacters can't break out
     // of the dispatcher argument (C9). The dispatcher arg is seconds; the
     // execFileSync timeout is ms with a buffer so the outer cap fires after
-    // the dispatcher's inner subprocess (S3).
-    execFileSync(INTERPRETER, [DISPATCHER, command, event, String(timeoutSec)], {{
+    // the dispatcher's inner subprocess (S3). stdout is captured and
+    // returned so context-injection hooks (experimental.chat.system.transform,
+    // chat.message) can push it into their outputs; stderr stays inherited so
+    // dispatcher errors remain visible (C11).
+    return execFileSync(INTERPRETER, [DISPATCHER, command, event, String(timeoutSec)], {{
       input: JSON.stringify({{ input, output }}),
-      stdio: ['pipe', 'inherit', 'inherit'],
+      stdio: ['pipe', 'pipe', 'inherit'],
+      encoding: 'utf-8',
       timeout: (timeoutSec + {buffer}) * 1000,
     }});
   }} catch (e) {{
@@ -381,6 +470,12 @@ function runEvent(command: string, event: string, input: any, output: any, timeo
     throw new Error(`specify event ${{command}} (${{event}}) failed: ${{(e as Error).message}}`);
   }}
 }}
+
+// Cache session_start handler output per sessionID so non-idempotent
+// handlers (setup, telemetry, file-mutating scripts) run once per session
+// instead of on every LLM request (experimental.chat.system.transform
+// fires per LLM turn). Evicted on session.deleted.
+const sessionStartCache = new Map<string, string>();
 
 {event_entries}
 
@@ -473,6 +568,30 @@ def _find_command_template(command_name: str, project_root: Path) -> tuple[Path 
     return None, None
 
 
+def _confine_event_script_path(
+    project_root: Path, base: Path, token: str
+) -> Path | None:
+    """Resolve *token* under *base*, or None if it leaves the project.
+
+    Rejects anchored tokens (absolute, drive, UNC) so ``Path`` cannot
+    discard *base*. ``..`` is allowed when the resolved path stays inside
+    *project_root*, which is how extension templates reach core scripts
+    via ``../../scripts/...``. Keep the generated ``_script_under_base``
+    in sync.
+    """
+    posix_path = PurePosixPath(token)
+    win_path = PureWindowsPath(token)
+    if posix_path.anchor or win_path.anchor:
+        return None
+    try:
+        root = project_root.resolve()
+        candidate = (base / token).resolve()
+        candidate.relative_to(root)
+    except (OSError, ValueError):
+        return None
+    return candidate
+
+
 def _resolve_event_command_argv(
     template_path: Path, project_root: Path, ext_id: str | None
 ) -> list[str] | None:
@@ -488,7 +607,15 @@ def _resolve_event_command_argv(
     """
     from .integrations.base import IntegrationBase
 
-    content = template_path.read_text(encoding="utf-8")
+    try:
+        content = template_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        # An unreadable or undecodable template cannot declare a runnable
+        # script. Degrade to "no argv" like every other failure in this
+        # resolver (missing frontmatter, malformed YAML, absent scripts)
+        # instead of leaking a raw traceback through
+        # resolve_and_run_event_command.
+        return None
     m = re.match(r'^---\n(.*?)\n---', content, re.DOTALL)
     if not m:
         return None
@@ -524,11 +651,17 @@ def _resolve_event_command_argv(
     else:
         base = project_root / ".specify"
 
-    tokens = shlex.split(script_cmd, posix=(os.name != "nt"))
+    try:
+        tokens = shlex.split(script_cmd, posix=(os.name != "nt"))
+    except ValueError:
+        # Mirror the generated dispatcher's _resolve_argv: a scripts: value
+        # shlex cannot tokenize (e.g. an unclosed quote) declares no runnable
+        # script, so degrade to "no argv" instead of raising.
+        return None
     if not tokens:
         return None
-    script_abs = base / tokens[0]
-    if not script_abs.exists():
+    script_abs = _confine_event_script_path(project_root, base, tokens[0])
+    if script_abs is None or not script_abs.exists():
         return None
     rest_args = tokens[1:]
 
@@ -585,12 +718,28 @@ def resolve_and_run_event_command(
     project_root: Path,
     *,
     timeout: int = 120,
+    envelope: str = "plain",
+    native_event: str = "",
 ) -> int:
     """Core entry point to resolve and execute an event-driven command.
 
     *timeout* is the per-handler timeout in seconds, passed through from the
     native hook config via the dispatcher (S4) so a handler configured above
     the previous fixed 120s cap can run for its full duration.
+
+    *envelope* selects how the handler's stdout is emitted for the agent's
+    context-injection protocol (C13): ``plain`` passthrough (Claude/Codex
+    inject plain stdout), ``hookSpecificOutput``/``additionalContext``/
+    ``additional_context`` JSON wrappers (Gemini/Tabnine/Qwen/Devin, Copilot,
+    Cursor respectively), ``hook_specific_output`` (Vibe's
+    HookStructuredResponse — any non-empty stdout that isn't valid JSON is
+    reported as a hook failure and dropped), or ``suppress`` (strict-JSON
+    agents on events whose output can't be used).
+
+    *native_event* is the agent's native hookEventName (e.g. ``"SessionStart"``),
+    required inside ``hookSpecificOutput`` by Qwen's hooks spec (and included
+    by the Claude Code hooks spec Gemini/Tabnine/Devin derive from). Only
+    used when *envelope* is ``hookSpecificOutput``.
     """
     template_path, ext_id = _find_command_template(command_name, project_root)
     if not template_path:
@@ -610,7 +759,7 @@ def resolve_and_run_event_command(
             cwd=str(project_root),
         )
         if result.stdout:
-            sys.stdout.write(result.stdout)
+            _emit_event_stdout(result.stdout, envelope, native_event)
         if result.returncode != 0:
             if result.stderr:
                 sys.stderr.write(result.stderr)
@@ -622,6 +771,42 @@ def resolve_and_run_event_command(
     except Exception as e:
         sys.stderr.write(f"Event command {command_name} error: {e}\n")
         return 2
+
+
+def _emit_event_stdout(output: str, envelope: str, native_event: str = "") -> None:
+    """Write handler stdout in the agent's context-injection shape (C13).
+
+    Mirrors the ``_emit`` helper inside the generated dispatcher template;
+    keep both in sync. Empty output emits nothing under any envelope.
+
+    *native_event* is the agent's native hookEventName, required inside
+    ``hookSpecificOutput`` by Qwen's hooks spec (and included by the
+    Claude Code hooks spec Gemini/Tabnine/Devin derive from).
+    """
+    if not output:
+        return
+    if envelope == "suppress":
+        return
+    if envelope == "hookSpecificOutput":
+        payload = {"additionalContext": output}
+        if native_event:
+            payload["hookEventName"] = native_event
+        sys.stdout.write(json.dumps({"hookSpecificOutput": payload}) + "\n")
+        return
+    if envelope == "additionalContext":
+        sys.stdout.write(json.dumps({"additionalContext": output}) + "\n")
+        return
+    if envelope == "additional_context":
+        sys.stdout.write(json.dumps({"additional_context": output}) + "\n")
+        return
+    if envelope == "hook_specific_output":
+        # Vibe parses any non-empty hook stdout as a HookStructuredResponse;
+        # plain text would be reported as a hook failure. Wrap it as an
+        # explicit allow with additional_context (injected on post_tool,
+        # harmlessly ignored on pre_tool/post_agent).
+        sys.stdout.write(json.dumps({"decision": "allow", "hook_specific_output": {"additional_context": output}}) + "\n")
+        return
+    sys.stdout.write(output)
 
 
 # -- Sourcing events map (CLI/Orchestration domain) -------------------------
@@ -737,8 +922,10 @@ def resolve_events(
     if override_file.exists():
         try:
             override = yaml.safe_load(override_file.read_text(encoding="utf-8")) or {}
-        except yaml.YAMLError:
-            logger.warning("Could not parse %s; ignoring override", override_file)
+        except (OSError, UnicodeError, yaml.YAMLError):
+            logger.warning(
+                "Could not read or parse %s; ignoring override", override_file
+            )
             override = {}
         integrations = override.get("integrations", {}) if isinstance(override, dict) else {}
         if isinstance(integrations, dict) and integration_key in integrations:
@@ -895,7 +1082,7 @@ def collect_extension_events(project_root: Path) -> ResolvedEvents:
                 continue
             try:
                 data = yaml.safe_load(ext_yml.read_text(encoding="utf-8")) or {}
-            except yaml.YAMLError:
+            except (UnicodeDecodeError, yaml.YAMLError):
                 continue
             if not isinstance(data, dict):
                 continue
@@ -974,11 +1161,31 @@ def _shell_quote(value: str, target_os: str) -> str:
     """
     if target_os == "windows":
         return "'" + value.replace("'", "''") + "'"
+    if target_os == "cmd":
+        # cmd.exe (Vibe launches hooks via create_subprocess_shell, which is
+        # %COMSPEC% on Windows): single quotes are not quoting there, so a
+        # POSIX-quoted path with spaces would break apart. Double-quote only
+        # when needed; embedded double quotes are doubled (MSVCRT argv
+        # parsing treats "" inside a quoted string as a literal quote).
+        if re.fullmatch(r"[A-Za-z0-9_.\-\\/:]+", value):
+            return value
+        return '"' + value.replace('"', '""') + '"'
     # "host" and "posix" both use POSIX quoting. On Windows the single-
     # command-string formats (Claude/Gemini/Qwen/Devin/Tabnine) are run via
     # Git Bash or the agent's POSIX-ish shell, so POSIX quoting is correct and
     # avoids emitting 'python' (which PowerShell wouldn't invoke without &).
     return shlex.quote(value)
+
+
+def _vibe_target_os() -> str:
+    """Quoting target for Vibe hook commands.
+
+    Vibe launches hooks with ``asyncio.create_subprocess_shell`` — the host's
+    native shell: POSIX ``sh`` on Unix, ``cmd.exe`` (%COMSPEC%) on Windows,
+    where POSIX single-quoting is not quoting at all and an interpreter or
+    dispatcher path containing spaces would split.
+    """
+    return "cmd" if os.name == "nt" else "host"
 
 
 def _dispatcher_command(
@@ -1003,6 +1210,8 @@ def _dispatcher_command(
     both POSIX and Windows variants into one checked-in file (Copilot): ``host``
     uses the host-resolved interpreter (venv-aware), while ``posix``/``windows``
     emit portable interpreters so the config works on either OS (#S4).
+    ``cmd`` also uses the host-resolved interpreter but quotes for cmd.exe —
+    for agents that launch hooks through the native Windows shell (Vibe).
 
     Each component is shell-quoted for the target shell (R2) so an interpreter
     path with spaces or a command/event containing shell metacharacters is
@@ -1016,9 +1225,22 @@ def _dispatcher_command(
     When *timeout_seconds* is given, the resolved timeout (in the
     integration's native unit) is appended as a 4th argument so the dispatcher
     and inner runner honor the per-handler timeout instead of a fixed 120s cap
-    that would kill a handler configured for longer (S4).
+    that would kill a handler configured for longer (S4). When omitted, a
+    default of 60s is emitted so the positional argument order
+    (command event timeout envelope native_event) stays aligned — otherwise
+    the envelope would land in the timeout slot and the dispatcher would
+    silently fall back to plain stdout.
+
+    When the integration declares a context-injection envelope for this
+    canonical event (``events_context_envelope``, C13), the envelope token is
+    appended as a 5th argument so the dispatcher wraps stdout in the JSON
+    shape the agent's hook protocol requires. Plain-passthrough agents
+    (Claude/Codex) declare no envelope and get no extra argument.
     """
-    if target_os == "host":
+    if target_os in ("host", "cmd"):
+        # "cmd" is host-resolved too (venv-aware): it is selected only when
+        # generating on a Windows host for an agent that runs hooks through
+        # cmd.exe (Vibe), and differs from "host" purely in quoting style.
         interpreter = _resolve_interpreter(project_root)
     else:
         interpreter = _resolve_interpreter_for_target(target_os)
@@ -1036,14 +1258,42 @@ def _dispatcher_command(
     # operator. Prefix & for the explicit windows target only.
     prefix = "& " if target_os == "windows" else ""
     base = f"{prefix}{q_interp} {dispatcher} {q_command} {q_event}"
-    if timeout_seconds is not None:
-        # R2: the dispatcher interprets this argument as seconds, so pass the
-        # raw seconds — NOT _native_timeout(...) (which converts to ms for
-        # Gemini/Qwen/Tabnine and would yield 60000 seconds). The buffer is
-        # applied to the native hook timeout field (in the adapter formatters)
-        # so the agent's outer cap fires after the inner subprocess timeout.
-        base += f" {_shell_quote(str(int(timeout_seconds)), target_os)}"
+    # Always emit the timeout (4th positional arg) so the dispatcher's argv
+    # parsing stays aligned when an envelope (5th) or native_event (6th)
+    # follows. Without it the envelope would land in the timeout slot and
+    # the dispatcher would fall back to plain stdout (R3).
+    resolved_timeout = 60 if timeout_seconds is None else int(timeout_seconds)
+    # R2: the dispatcher interprets this argument as seconds, so pass the
+    # raw seconds — NOT _native_timeout(...) (which converts to ms for
+    # Gemini/Qwen/Tabnine and would yield 60000 seconds). The buffer is
+    # applied to the native hook timeout field (in the adapter formatters)
+    # so the agent's outer cap fires after the inner subprocess timeout.
+    base += f" {_shell_quote(str(resolved_timeout), target_os)}"
+    envelope = _context_envelope_for(integration, event_name)
+    if envelope:
+        base += f" {_shell_quote(envelope, target_os)}"
+        # hookSpecificOutput requires the native hookEventName inside the
+        # envelope (Qwen's hooks spec marks it mandatory; the Claude Code
+        # hooks spec that Gemini/Tabnine/Devin derive from includes it).
+        # Append the native event name as a 6th dispatcher argument so the
+        # dispatcher can populate hookEventName in the JSON output.
+        if envelope == "hookSpecificOutput":
+            native_event = getattr(integration, "CANONICAL_TO_NATIVE", {}).get(event_name, "")
+            if native_event:
+                base += f" {_shell_quote(native_event, target_os)}"
     return base
+
+
+def _context_envelope_for(integration: IntegrationBase, canonical_event: str) -> str | None:
+    """Resolve the context-injection envelope for an integration + event (C13).
+
+    The event key wins; ``"*"`` is the fallback. Returns ``None`` when the
+    integration declares no envelope for the event (plain stdout passthrough).
+    """
+    mapping = getattr(integration, "events_context_envelope", None) or {}
+    if canonical_event in mapping:
+        return mapping[canonical_event]
+    return mapping.get("*")
 
 
 def install_integration_events(
@@ -1193,11 +1443,61 @@ def install_integration_events(
                 lines.append(f'timeout = {_native_timeout(integration, cfg.get("timeout", 60) + EVENT_TIMEOUT_BUFFER)}')
                 lines.append('speckit_marker = true')
                 lines.append('')
-        _merge_toml_fragment(config_path, "\n".join(lines))
-        rel = str(config_path.relative_to(project_root))
-        if rel not in manifest.files:
-            manifest.record_existing(rel)
-        created.append(config_path)
+        # S5: only track when the merge wrote (skips on unreadable file).
+        if _merge_toml_fragment(config_path, "\n".join(lines)):
+            rel = str(config_path.relative_to(project_root))
+            if rel not in manifest.files:
+                manifest.record_existing(rel)
+            created.append(config_path)
+
+    elif fmt == "toml-vibe":
+        # Vibe hooks.toml custom merge. Flat [[hooks]] array; Vibe's
+        # HookConfig schema is name/type/command/match/timeout, with type
+        # limited to "pre_tool" | "post_tool" | "post_agent". Hook names must
+        # be unique (Vibe silently drops duplicates by name), so a per-file
+        # counter suffix disambiguates handlers whose commands share a final
+        # segment (e.g. speckit.a.validate vs speckit.b.validate).
+        lines: list[str] = []
+        used_names: set[str] = set()
+        for ev, handlers in filtered.items():
+            native = canonical_to_native[ev]
+            for cfg in handlers:
+                command = cfg.get("command", "")
+                dispatcher_cmd = _dispatcher_command(
+                    integration, project_root, command, ev,
+                    target_os=_vibe_target_os(),
+                    timeout_seconds=cfg.get("timeout", 60),
+                )
+                command_stem = command.split('.')[-1] if command else "unknown"
+                command_stem = re.sub(r'[^A-Za-z0-9_-]+', '-', command_stem) or "unknown"
+                base_name = f"speckit-{native}-{command_stem}"
+                hook_name = base_name
+                suffix = 2
+                while hook_name in used_names:
+                    hook_name = f"{base_name}-{suffix}"
+                    suffix += 1
+                used_names.add(hook_name)
+                lines.append("[[hooks]]")
+                lines.append(f'name = {_toml_quote(hook_name)}')
+                lines.append(f'type = {_toml_quote(native)}')
+                # Vibe's field is `match` (fnmatch glob, or `re:`-prefixed
+                # regex, case-insensitive) and it is only valid on tool
+                # hooks — HookConfig rejects `match` on post_agent. Canonical
+                # matchers are Claude-style regexes ("Edit|Write"), so
+                # non-wildcard matchers are emitted as `re:` patterns.
+                matcher = cfg.get("matcher", "*")
+                if matcher and matcher != "*" and native in ("pre_tool", "post_tool"):
+                    lines.append(f'match = {_toml_quote("re:" + matcher)}')
+                lines.append(f'command = {_toml_quote(dispatcher_cmd)}')
+                lines.append(f'timeout = {_native_timeout(integration, cfg.get("timeout", 60) + EVENT_TIMEOUT_BUFFER)}')
+                lines.append('speckit_marker = true')
+                lines.append('')
+        # S5: only track when the merge wrote (skips on unreadable file).
+        if _merge_vibe_toml_fragment(config_path, "\n".join(lines)):
+            rel = str(config_path.relative_to(project_root))
+            if rel not in manifest.files:
+                manifest.record_existing(rel)
+            created.append(config_path)
 
     elif fmt == "json-flat":
         # Cursor hooks.json custom merge. Flat command-string entries, one
@@ -1321,6 +1621,8 @@ def _remove_native_event_hooks(
         _remove_copilot_entries(config_path)
     elif fmt == "toml":
         _remove_toml_entries(config_path)
+    elif fmt == "toml-vibe":
+        _remove_vibe_toml_entries(config_path)
     elif fmt in ("json-nested", "json-flat"):
         _remove_json_entries(config_path)
     elif fmt == "json-root-nested":
@@ -1588,6 +1890,14 @@ def _build_opencode_plugin(
     an argv array (C9). Both the ``input`` and ``output`` callback arguments
     are forwarded to ``runEvent`` (C7) so pre_tool_use can inspect tool
     arguments and post_tool_use can inspect the result.
+
+    Context-injection natives get dedicated hook bodies: for
+    ``experimental.chat.system.transform`` the handlers' concatenated stdout
+    is pushed into ``output.system`` (system-prompt injection, re-applied per
+    LLM request so the context survives compaction); for ``chat.message`` it
+    is pushed as a synthetic text part on the user message (C11). Other
+    natives keep their side-effect behavior (tool.execute.* args mutation;
+    session.* lifecycle events via the generic ``event`` hook).
     """
     event_entries: list[str] = []
     plugin_returns: list[str] = []
@@ -1602,11 +1912,16 @@ def _build_opencode_plugin(
         ev_lit = json.dumps(ev)
         native_lit = json.dumps(native)
 
+        is_injection = native in ("experimental.chat.system.transform", "chat.message")
+
         # Build the body: one runEvent() call per handler wrapped in try/catch,
         # forwarding both input and output (C7). An optional tool-name matcher
         # guard applies to tool.execute.* hooks. All handlers execute before
-        # any aggregate error is thrown.
+        # any aggregate error is thrown. Injection hooks additionally collect
+        # each handler's stdout and return the concatenation.
         body_lines: list[str] = ["    const errors: string[] = [];"]
+        if is_injection:
+            body_lines.append("    const contexts: string[] = [];")
         for cfg in handlers:
             command = str(cfg.get("command", ""))
             command_lit = json.dumps(command)
@@ -1628,6 +1943,10 @@ def _build_opencode_plugin(
                     body_lines.append(
                         f"    try {{ runEvent({command_lit}, {ev_lit}, input, output, {timeout_sec}); }} catch (e) {{ errors.push((e as Error).message); }}"
                     )
+            elif is_injection:
+                body_lines.append(
+                    f"    try {{ const ctx = runEvent({command_lit}, {ev_lit}, input, output, {timeout_sec}); if (ctx) contexts.push(ctx); }} catch (e) {{ errors.push((e as Error).message); }}"
+                )
             else:
                 body_lines.append(
                     f"    try {{ runEvent({command_lit}, {ev_lit}, input, output, {timeout_sec}); }} catch (e) {{ errors.push((e as Error).message); }}"
@@ -1646,14 +1965,65 @@ def _build_opencode_plugin(
                 f"      _{ev}(input, output);\n"
                 f"    }},"
             )
+        elif native == "experimental.chat.system.transform":
+            body_lines.append('    return contexts.join("\\n\\n");')
+            event_entries.append(
+                f"function _{ev}(input: any, output: any): string {{\n"
+                + "\n".join(body_lines) + "\n"
+                "  }"
+            )
+            # OpenCode fires experimental.chat.system.transform for non-session
+            # operations (e.g. agent generation) with no sessionID. Guard so
+            # canonical session_start handlers only run when a session is
+            # present, preventing their output from being injected into
+            # internal prompts. Cache the handler output per sessionID so
+            # non-idempotent handlers (setup, telemetry, file-mutating
+            # scripts) execute once per session instead of on every LLM
+            # request; the cache is evicted on session.deleted.
+            plugin_returns.append(
+                f"    {native_lit}: async (input: any, output: any) => {{\n"
+                f"      if (!input.sessionID) return;\n"
+                f"      let ctx = sessionStartCache.get(input.sessionID);\n"
+                f"      if (ctx === undefined) {{\n"
+                f"        ctx = _{ev}(input, output);\n"
+                f"        sessionStartCache.set(input.sessionID, ctx ?? \"\");\n"
+                f"      }}\n"
+                f"      if (ctx) output.system.push(ctx);\n"
+                f"    }},"
+            )
+        elif native == "chat.message":
+            body_lines.append('    return contexts.join("\\n\\n");')
+            event_entries.append(
+                f"function _{ev}(input: any, output: any): string {{\n"
+                + "\n".join(body_lines) + "\n"
+                "  }"
+            )
+            # Part id must start with "prt" (opencode's Identifier brand): an
+            # invalid id fails the user-part schema validation and crashes the
+            # whole session (C12). Derive it from the last existing part so the
+            # brand survives an opencode prefix change, falling back to "prt_"
+            # when output.parts is empty.
+            plugin_returns.append(
+                f"    {native_lit}: async (input: any, output: any) => {{\n"
+                f"      const ctx = _{ev}(input, output);\n"
+                f"      if (!ctx) return;\n"
+                f"      const base = output.parts[output.parts.length - 1]?.id ?? \"prt_\" + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);\n"
+                f"      output.parts.push({{ id: base + \".speckit\" + Math.random().toString(36).slice(2, 8), sessionID: input.sessionID, messageID: output.message.id, type: \"text\", text: ctx, synthetic: true }});\n"
+                f"    }},"
+            )
         else:
             event_entries.append(
                 f"function _{ev}(input: any, output: any) {{\n"
                 + "\n".join(body_lines) + "\n"
                 "  }"
             )
+            # Evict the sessionStartCache when the session is deleted so the
+            # cache doesn't grow unbounded across sessions.
+            eviction = ""
+            if native == "session.deleted":
+                eviction = "if (event.sessionID) sessionStartCache.delete(event.sessionID); "
             event_handlers.append(
-                f"      if (event.type === {native_lit}) {{ _{ev}(event, event); }}"
+                f"      if (event.type === {native_lit}) {{ {eviction}_{ev}(event, event); }}"
             )
 
     if event_handlers:
@@ -1715,11 +2085,27 @@ def _remove_opencode_entries(config_path: Path) -> bool:
     return False
 
 
-def _merge_toml_fragment(dst: Path, fragment: str) -> None:
+def _merge_toml_fragment(dst: Path, fragment: str) -> bool:
+    """Merge Specify-owned TOML entries into *dst*, regenerating the file.
+
+    An unreadable or undecodable pre-existing file aborts the merge instead
+    of discarding the user's bytes, mirroring ``_load_user_json`` (#22).
+    Returns False when skipped so callers avoid tracking the untouched file
+    (S5).
+    """
     _ensure_safe_destination(dst)
     existing = ""
     if dst.exists():
-        existing = dst.read_text(encoding="utf-8")
+        try:
+            existing = dst.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            logger.warning(
+                "Could not read %s (it may be unreadable or not UTF-8); "
+                "skipping event-config merge to preserve user content.",
+                dst,
+            )
+            logger.debug("Read error detail: %s", exc)
+            return False
     existing = re.sub(
         r'\[\[hooks\.\w+\]\]\n(?:(?!\[\[hooks\.\w+\]\]).)*?speckit_marker = true\n*',
         "",
@@ -1728,6 +2114,43 @@ def _merge_toml_fragment(dst: Path, fragment: str) -> None:
     )
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_text(existing.rstrip() + "\n\n" + fragment + "\n", encoding="utf-8")
+    return True
+
+
+def _merge_vibe_toml_fragment(dst: Path, fragment: str) -> bool:
+    """Merge Specify-owned Vibe TOML hook entries into *dst*, regenerating the file.
+
+    Vibe uses a flat [[hooks]] array with type/matcher/command fields.
+    This removes any existing Specify-marked hooks and appends the new fragment.
+    An unreadable or undecodable pre-existing file aborts the merge instead
+    of discarding the user's bytes, mirroring ``_load_user_json`` (#22).
+    Returns False when skipped so callers avoid tracking the untouched file
+    (S5).
+    """
+    _ensure_safe_destination(dst)
+    existing = ""
+    if dst.exists():
+        try:
+            existing = dst.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            logger.warning(
+                "Could not read %s (it may be unreadable or not UTF-8); "
+                "skipping event-config merge to preserve user content.",
+                dst,
+            )
+            logger.debug("Read error detail: %s", exc)
+            return False
+    # Remove existing Specify-marked [[hooks]] blocks
+    # Match [[hooks]] ... speckit_marker = true (with any content in between)
+    existing = re.sub(
+        r'\[\[hooks\]\]\n(?:(?!\[\[hooks\]\]).)*?speckit_marker = true\n*',
+        "",
+        existing,
+        flags=re.DOTALL,
+    )
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text(existing.rstrip() + "\n\n" + fragment + "\n", encoding="utf-8")
+    return True
 
 
 def _remove_toml_entries(dst: Path) -> bool:
@@ -1741,7 +2164,19 @@ def _remove_toml_entries(dst: Path) -> bool:
     # the config after install can't make teardown overwrite a file outside
     # the project (the merge/write path already validates; teardown must too).
     _ensure_safe_destination(dst)
-    existing = dst.read_text(encoding="utf-8")
+    try:
+        existing = dst.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        # An unreadable or undecodable file is left untouched rather than
+        # crashing teardown — it contains only user content as far as we can
+        # tell, and the caller drops the manifest claim either way (S9).
+        logger.warning(
+            "Could not read %s (it may be unreadable or not UTF-8); "
+            "skipping event-config cleanup to preserve user content.",
+            dst,
+        )
+        logger.debug("Read error detail: %s", exc)
+        return False
     cleaned = re.sub(
         r'\[\[hooks\.\w+\]\]\n(?:(?!\[\[hooks\.\w+\]\]).)*?speckit_marker = true\n*',
         "",
@@ -1750,6 +2185,43 @@ def _remove_toml_entries(dst: Path) -> bool:
     )
     # If only whitespace/comments remain, the file had no user content —
     # delete it rather than leaving an empty stub that confuses uninstall.
+    stripped = "\n".join(
+        line for line in cleaned.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    )
+    if not stripped:
+        dst.unlink(missing_ok=True)
+        return True
+    dst.write_text(cleaned, encoding="utf-8")
+    return False
+
+
+def _remove_vibe_toml_entries(dst: Path) -> bool:
+    """Remove Specify-marked Vibe TOML hook entries; delete the file if now empty.
+
+    Returns True if the file was deleted (no user content remained).
+    """
+    if not dst.exists():
+        return False
+    _ensure_safe_destination(dst)
+    try:
+        existing = dst.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        logger.warning(
+            "Could not read %s (it may be unreadable or not UTF-8); "
+            "skipping event-config cleanup to preserve user content.",
+            dst,
+        )
+        logger.debug("Read error detail: %s", exc)
+        return False
+    # Remove Specify-marked [[hooks]] blocks
+    cleaned = re.sub(
+        r'\[\[hooks\]\]\n(?:(?!\[\[hooks\]\]).)*?speckit_marker = true\n*',
+        "",
+        existing,
+        flags=re.DOTALL,
+    )
+    # If only whitespace/comments remain, the file had no user content
     stripped = "\n".join(
         line for line in cleaned.splitlines()
         if line.strip() and not line.strip().startswith("#")
