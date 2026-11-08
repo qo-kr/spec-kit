@@ -52,8 +52,12 @@ esac
 command -v codex >/dev/null 2>&1 || die 2 "codex CLI not found"
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die 2 "not inside a git work tree"
 
-if [ -z "$BASE" ] && command -v gh >/dev/null 2>&1; then
-    BASE="$(gh pr view --json baseRefName -q .baseRefName 2>/dev/null || true)"
+# shellcheck source=oq-common.sh
+. "$(dirname "$0")/oq-common.sh"
+REPO="$(oq_origin_repo)"
+BRANCH="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+if [ -z "$BASE" ] && [ -n "$REPO" ] && [ -n "$BRANCH" ] && command -v gh >/dev/null 2>&1; then
+    BASE="$(gh pr view "$BRANCH" -R "$REPO" --json baseRefName -q .baseRefName 2>/dev/null || true)"
 fi
 if [ -z "$BASE" ]; then
     BASE="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"

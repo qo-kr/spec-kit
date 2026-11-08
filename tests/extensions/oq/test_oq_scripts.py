@@ -36,10 +36,11 @@ exit "${FAKE_RC:-0}"
 """
 
 GH_STUB = r"""#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$STUB_DIR/gh-calls"
+case " $* " in *" -R qo-kr/example "*) ;; *) exit 1 ;; esac
 case "$*" in
   *baseRefName*) [ -n "${FAKE_BASE:-}" ] && echo "$FAKE_BASE" && exit 0; exit 1 ;;
   *headRefOid*) [ -n "${FAKE_PR_HEAD:-}" ] && echo "$FAKE_PR_HEAD" && exit 0; exit 1 ;;
-  *nameWithOwner*) echo "qo-kr/example"; exit 0 ;;
 esac
 exit 1
 """
@@ -74,12 +75,17 @@ def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
     work = tmp_path / "work"
     subprocess.run(["git", "init", "-q", "-b", "main", str(work)], check=True)
-    _git(work, "remote", "add", "origin", str(origin))
+    # origin looks like GitHub (the scripts derive owner/name from it) but
+    # fetches and pushes are rewritten to the local bare repository.
+    _git(work, "remote", "add", "origin", "https://github.com/qo-kr/example.git")
+    _git(work, "config", f"url.{origin.as_uri()}.insteadOf", "https://github.com/qo-kr/example.git")
+    _git(work, "remote", "add", "upstream", "https://github.com/github/example.git")
     (work / "README.md").write_text("base\n")
     _git(work, "add", ".")
     _git(work, "commit", "-q", "-m", "base")
     _git(work, "push", "-q", "origin", "main")
     _git(work, "push", "-q", "origin", "main:dev")
+    _git(work, "fetch", "-q", "origin")
     _git(work, "remote", "set-head", "origin", "main")
     _git(work, "checkout", "-q", "-b", "feature")
     feature = work / "specs" / "001-x"
@@ -131,6 +137,14 @@ class TestCodexReview:
         assert "OQ_REVIEW_BASE=origin/dev" in result.stdout
         line = _ledger(work).read_text().splitlines()[-1].split("\t")
         assert line[:3] == [head, "origin/dev", "gpt-6.1-sol"]
+
+    def test_gh_targets_origin_repo_not_upstream(self, repo):
+        work, stub = repo
+        result = _run(REVIEW, work, FAKE_BASE="dev")
+        assert result.returncode == 0, result.stderr
+        calls = (stub / "gh-calls").read_text()
+        assert "-R qo-kr/example" in calls
+        assert "github/example" not in calls
 
     def test_falls_back_to_origin_head_without_pr(self, repo):
         work, stub = repo
@@ -308,3 +322,26 @@ class TestCommandsUseScripts:
             installed = tmp_path / ".specify" / "extensions" / "oq" / "scripts" / "bash" / name
             assert installed.is_file(), installed
             assert os.access(installed, os.X_OK), f"{installed} is not executable"
+
+
+@pytest.mark.parametrize(
+    "url, expected",
+    [
+        ("git@github.com:qo-kr/spec-kit.git", "qo-kr/spec-kit"),
+        ("https://github.com/qo-kr/spec-kit.git", "qo-kr/spec-kit"),
+        ("https://github.com/qo-kr/spec-kit", "qo-kr/spec-kit"),
+        ("ssh://git@github.com/qo-kr/spec-kit.git", "qo-kr/spec-kit"),
+        ("https://gitlab.com/qo-kr/spec-kit.git", ""),
+        ("https://github.com/qo-kr/spec-kit/extra", ""),
+        ("https://github.com/qo-kr/sp ec", ""),
+        ("/srv/git/origin.git", ""),
+    ],
+)
+def test_origin_repo_parsing(tmp_path: Path, url: str, expected: str):
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    _git(tmp_path, "remote", "add", "origin", url)
+    out = subprocess.run(
+        ["bash", "-c", f'. "{SCRIPTS / "oq-common.sh"}"; oq_origin_repo'],
+        cwd=tmp_path, capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert out == expected

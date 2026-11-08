@@ -39,17 +39,14 @@ report() { # name status detail
     [ "$2" = "PASS" ] || FAILED=1
 }
 
+# shellcheck source=oq-common.sh
+. "$(dirname "$0")/oq-common.sh"
 LOCAL_HEAD="$(git rev-parse HEAD)"
 PR_HEAD=""
-REPO=""
-if command -v gh >/dev/null 2>&1; then
-    PR_HEAD="$(gh pr view "$PR" --json headRefOid -q .headRefOid 2>/dev/null || true)"
-    REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
+REPO="$(oq_origin_repo)"
+if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
+    PR_HEAD="$(gh pr view "$PR" -R "$REPO" --json headRefOid -q .headRefOid 2>/dev/null || true)"
 fi
-case "$REPO" in
-    */*) ;;
-    *) REPO="" ;;
-esac
 
 if [ -z "$PR_HEAD" ]; then
     report pr-head UNMEASURED "could not read PR #$PR head SHA with gh"
@@ -88,7 +85,7 @@ check_doc value-doc VALUE.md
 check_doc postmortem POSTMORTEM.md
 
 if [ -z "$REPO" ]; then
-    report repo UNMEASURED "could not read owner/name with gh repo view"
+    report repo UNMEASURED "origin is not a GitHub URL; cannot name the repository for gh -R"
 fi
 
 if [ "$FAILED" -ne 0 ]; then
