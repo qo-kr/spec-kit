@@ -24,6 +24,7 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 MAX_BRANCH_LENGTH = 244  # GitHub enforces a 244-byte limit on branch names
+MAX_FEATURE_NUMBER = 2**63 - 1
 
 USAGE = (
     "Usage: create_new_feature_branch.py [--json] [--dry-run] "
@@ -76,6 +77,16 @@ def _persist_hint(var_name: str, value: str) -> str:
     return f"export {var_name}={escaped_value}"
 
 
+def _int64_from_digits(value: str) -> int | None:
+    normalized = value.lstrip("0") or "0"
+    maximum = str(MAX_FEATURE_NUMBER)
+    if len(normalized) > len(maximum) or (
+        len(normalized) == len(maximum) and normalized > maximum
+    ):
+        return None
+    return int(normalized, 10)
+
+
 @dataclass
 class Args:
     json_mode: bool = False
@@ -113,6 +124,14 @@ def parse_args(argv: list[str]) -> Args:
             if not re.fullmatch(r"[0-9]+", args.branch_number):
                 _err("Error: --number must be a non-negative integer")
                 raise SystemExit(1)
+            normalized_number = _int64_from_digits(args.branch_number)
+            if normalized_number is None:
+                _err(
+                    "Error: --number must be between 0 and "
+                    f"{MAX_FEATURE_NUMBER}, got '{args.branch_number}'"
+                )
+                raise SystemExit(1)
+            args.branch_number = str(normalized_number)
         elif arg == "--timestamp":
             args.use_timestamp = True
         elif arg in ("--help", "-h"):
@@ -271,6 +290,7 @@ def check_existing_branches(
             cwd=repo_root,
             capture_output=True,
             text=True,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
         )
         highest_branch = get_highest_from_branches(repo_root, scope_prefix)
 
@@ -297,8 +317,15 @@ def generate_branch_name(description: str) -> str:
         if len(word) >= 3:
             meaningful_words.append(word)
         # Keep short words only when they appear uppercased in the original
-        # description (acronyms like "API" or "DB").
-        elif re.search(rf"\b{re.escape(word.upper())}\b", description):
+        # description (acronyms like "API" or "DB"). The boundaries are spelled
+        # out as ASCII rather than using \b: \b is Unicode-aware on str, so
+        # "\u00e9DB\u00e9 cache" would hide the acronym behind a non-ASCII word
+        # character, while the bash twin's `grep -qw` runs under LC_ALL=C and
+        # sees a boundary there.
+        elif re.search(
+            rf"(?<![0-9A-Za-z_]){re.escape(word.upper())}(?![0-9A-Za-z_])",
+            description,
+        ):
             meaningful_words.append(word)
 
     if meaningful_words:
@@ -522,7 +549,21 @@ def main(argv: list[str]) -> int:
                 else:
                     branch_number = get_highest_from_specs(specs_dir) + 1
 
-            feature_num = f"{int(branch_number):03d}"
+            try:
+                feature_number = int(branch_number)
+            except ValueError:
+                _err(
+                    "Error: feature number must be between 0 and "
+                    f"{MAX_FEATURE_NUMBER}, got '{branch_number}'"
+                )
+                return 1
+            if not 0 <= feature_number <= MAX_FEATURE_NUMBER:
+                _err(
+                    "Error: feature number must be between 0 and "
+                    f"{MAX_FEATURE_NUMBER}, got '{branch_number}'"
+                )
+                return 1
+            feature_num = f"{feature_number:03d}"
             branch_name = build_branch_name(feature_num, branch_suffix)
 
     branch_byte_len = _byte_length(branch_name)

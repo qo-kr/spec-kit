@@ -1,28 +1,34 @@
 """A string condition with no ``{{ }}`` block is never evaluated (always true)."""
 
+import re
+
 import pytest
 import yaml
 
+from specify_cli.workflows import expressions
 from specify_cli.workflows.base import StepContext
 from specify_cli.workflows.expressions import (
     condition_has_malformed_expression_block,
+    condition_is_interpolated_to_text,
     condition_is_never_evaluated,
     evaluate_condition,
+    evaluate_expression,
     format_condition_correction,
     _has_unbalanced_quote,
     _has_unbalanced_bracket,
     _has_incomplete_operand,
     _unresolvable_term,
+    _collect_leaves,
     _evaluator_rejects,
-    _is_literal,
     _strip_stray_delimiters,
     _COMPARISON_OPERATORS,
     _WORD_OPERATORS,
     format_condition_remediation,
 )
-from specify_cli.workflows.steps.do_while import DoWhileStep
-from specify_cli.workflows.steps.if_then import IfThenStep
-from specify_cli.workflows.steps.while_loop import WhileStep
+from specify_cli.workflows.expressions import namespace
+from specify_cli.workflows.step.do_while import DoWhileStep
+from specify_cli.workflows.step.if_then import IfThenStep
+from specify_cli.workflows.step.while_loop import WhileStep
 
 STEP_CLASSES = [IfThenStep, WhileStep, DoWhileStep]
 
@@ -139,6 +145,75 @@ def test_a_malformed_block_can_raise_rather_than_be_true():
     ctx = StepContext(inputs={"count": 5})
     with pytest.raises(ValueError):
         evaluate_condition("{{ inputs.missing | default('oops }}", ctx)
+
+
+# A third fault. The braces are present and they close, but they do not cover the
+# whole condition, so `evaluate_expression` leaves its typed fast path: each block is
+# substituted into the surrounding text and the result is a *string*, which
+# `evaluate_condition` then coerces. Every one of these reads as a real expression and
+# is always true. The validators already told authors the condition must be "a single
+# complete '{{ }}' block" -- nothing checked it.
+INTERPOLATED_TO_TEXT = [
+    "{{ inputs.ready }} and {{ inputs.count > 100 }}",   # two blocks joined by an operator
+    "{{ inputs.ready }} or {{ inputs.ready }}",
+    "not {{ inputs.ready }}",                            # operator outside the block
+    "{{ inputs.count }} > 100",                          # comparison outside the block
+    "ready: {{ inputs.ready }}",                         # prose around one block
+    "{{ inputs.ready }}x",                               # a single trailing character
+]
+
+
+@pytest.mark.parametrize("condition", INTERPOLATED_TO_TEXT)
+def test_a_condition_spliced_into_text_is_silently_true_and_is_flagged(condition):
+    # Ground truth first: the interpolated form really is a string, and really is true
+    # for a set of inputs where the expression the author wrote would be false.
+    ctx = StepContext(inputs={"ready": False, "count": 0})
+    rendered = evaluate_expression(condition, ctx)
+    assert isinstance(rendered, str)
+    assert evaluate_condition(condition, ctx) is True
+
+    assert condition_is_interpolated_to_text(condition) is True
+
+
+@pytest.mark.parametrize("condition", INTERPOLATED_TO_TEXT)
+@pytest.mark.parametrize("step_cls", STEP_CLASSES)
+def test_every_condition_step_rejects_a_spliced_condition(step_cls, condition):
+    config = {"id": "s1", "condition": condition, "then": [], "steps": []}
+    errors = [e for e in step_cls().validate(config) if "'condition'" in e]
+
+    assert len(errors) == 1
+    assert "single '{{ }}' block" in errors[0]
+    # No paste-ready correction: there is no single right rewrite of `{{ a }} and {{ b }}`.
+    assert "Wrap the expression" not in errors[0]
+
+
+VALID_SINGLE_BLOCKS = [
+    "{{ inputs.ready }}",
+    "{{ inputs.ready and inputs.count > 100 }}",
+    "{{ not inputs.ready }}",
+    "{{ inputs.tags | join(', ') == 'a, b' }}",
+    # A '}}' inside a quoted argument does not end the block, so this is still one
+    # expression and must stay on the fast path.
+    "{{ inputs.text | contains('}}') }}",
+    # `evaluate_expression` strips before testing the fast path, so surrounding
+    # whitespace is not "text around the block" and must stay accepted.
+    "  {{ inputs.ready }}  ",
+]
+
+
+@pytest.mark.parametrize("condition", VALID_SINGLE_BLOCKS)
+@pytest.mark.parametrize("step_cls", STEP_CLASSES)
+def test_a_single_complete_block_is_still_accepted(step_cls, condition):
+    """The narrowing must not widen: one block, however complex, is the supported form."""
+    assert condition_is_interpolated_to_text(condition) is False
+    config = {"id": "s1", "condition": condition, "then": [], "steps": []}
+    assert [e for e in step_cls().validate(config) if "'condition'" in e] == []
+
+
+@pytest.mark.parametrize("condition", NEVER_EVALUATED + MALFORMED_BLOCKS)
+def test_the_older_two_faults_keep_their_own_message(condition):
+    """The new check yields to both, so each fault keeps the advice written for it."""
+    assert condition_is_interpolated_to_text(condition) is False
 
 
 @pytest.mark.parametrize("condition", NEVER_EVALUATED + MALFORMED_BLOCKS)
@@ -342,16 +417,19 @@ def test_wrapping_whitespace_would_invert_the_condition():
     assert evaluate_condition("{{ }}", ctx) is False
 
 
-def test_wrapping_an_open_quote_inverts_the_condition():
+def test_wrapping_an_open_quote_is_not_a_repair():
     """Why the unbalanced-quote case gets advice instead of a suggestion.
 
-    The raw-close fallback evaluates a truncated comparison and yields the string
-    "False", which evaluate_condition then reads as the `false` keyword. Pasting
-    the "correction" flips the condition rather than repairing it.
+    The unwrapped form interpolates verbatim into non-empty text, so the
+    condition reads true. The "wrapped" form is an expression the evaluator
+    refuses: the parser raises an error for the unterminated quote
+    instead of the former hand-written engine's silent ``False``.
+    Either way, pasting the "correction" does not repair the condition.
     """
     ctx = StepContext(inputs={"name": "Bob"})
     assert evaluate_condition("{{ inputs.name == 'abc", ctx) is True
-    assert evaluate_condition("{{ inputs.name == 'abc }}", ctx) is False
+    with pytest.raises(ValueError, match="invalid expression"):
+        evaluate_condition("{{ inputs.name == 'abc }}", ctx)
 
 
 @pytest.mark.parametrize(
@@ -469,6 +547,107 @@ def test_incomplete_operand_covers_every_operator_the_evaluator_splits_on():
         assert _has_incomplete_operand("inputs.a" + op + "inputs.b") is False, op
 
 
+@pytest.mark.parametrize(
+    "text,incomplete",
+    [
+        ("inputs.items | length > 0", False),
+        ("inputs.s | contains('h') and inputs.t", False),
+        ("(inputs.x | upper) | lower == 'x'", False),
+        ("inputs.a || inputs.b", True),
+        ("inputs.a == == inputs.b", True),
+        ("inputs.a == and", True),
+        ("inputs.a and or inputs.b", True),
+        ("and", True),
+        ("or", True),
+        ("in", True),
+        ("not in", True),
+        ("not", True),
+        ("| upper", True),
+        ("inputs.items | length >", True),
+        ("inputs.mode not 'done'", False),
+        ("9" * 5000, False),
+    ],
+)
+def test_incomplete_operand_tells_a_filter_chain_from_a_missing_operand(
+    text, incomplete
+):
+    """An operator token only means a missing operand where an operand was
+    expected; after a filter chain it is a filter precedence mistake."""
+    assert _has_incomplete_operand(text) is incomplete
+
+
+# Review of #5171: `not` right after an operand was reported as a filter
+# precedence mistake, because the message was inferred from the terminals the
+# parser expected and `|` is expected there too. The grammar now parses filter
+# chains everywhere and the tree names the operator that has one as operand.
+@pytest.mark.parametrize(
+    "expr,near",
+    [
+        ("inputs.mode not 'done'", "unexpected 'not' at column 13"),
+        ("(inputs.a not inputs.b)", "unexpected 'not' at column 11"),
+        ("[1, inputs.a not 2]", "unexpected 'not' at column 14"),
+        ("inputs.a == inputs.b not 'x'", "unexpected 'not' at column 22"),
+    ],
+)
+def test_a_malformed_expression_without_a_filter_gets_no_filter_advice(expr, near):
+    with pytest.raises(ValueError) as info:
+        evaluate_expression("{{ " + expr + " }}", StepContext())
+
+    assert "filter precedence" not in str(info.value)
+    assert near in str(info.value)
+
+
+@pytest.mark.parametrize("step_cls", STEP_CLASSES)
+def test_a_condition_without_a_filter_is_not_told_to_parenthesize_one(step_cls):
+    config = {"id": "s1", "condition": "inputs.mode not 'done'", "then": [], "steps": []}
+    errors = [e for e in step_cls().validate(config) if "'condition'" in e]
+
+    assert len(errors) == 1
+    assert "filter" not in errors[0]
+    assert "unexpected 'not'" in errors[0]
+
+
+@pytest.mark.parametrize(
+    "expr,message",
+    [
+        ("(inputs.items | length > 0)", "'>' follows a filter chain"),
+        ("[inputs.items | length and inputs.ok]", "'and' follows a filter chain"),
+        ("inputs.x | default(inputs.items | length > 0)", "'>' follows a filter chain"),
+        ("(inputs.n > inputs.limit | default(5))", "an operand of '>'"),
+        ("[1, not inputs.x | default(1)]", "an operand of 'not'"),
+        ("inputs.a == not inputs.b | default(1)", "an operand of 'not'"),
+        ("inputs.count > inputs.limit | default(5)", "an operand of '>'; parenthesize"),
+        # Two misplaced chains: the leftmost operator is named.
+        (
+            "inputs.items | length == inputs.a and inputs.b > inputs.c | length",
+            "'==' follows a filter chain",
+        ),
+    ],
+)
+def test_filter_precedence_is_refused_at_any_nesting_depth(expr, message):
+    with pytest.raises(ValueError, match="ambiguous filter precedence") as info:
+        evaluate_expression("{{ " + expr + " }}", StepContext())
+
+    assert message in str(info.value)
+
+
+@pytest.mark.parametrize(
+    "expr,value",
+    [
+        ("(inputs.items | length) > 1", True),
+        ("1 < (inputs.items | length)", True),
+        ("[inputs.items | length, 1]", [2, 1]),
+        ("inputs.items | join(',') | upper", "A,B"),
+        ("(inputs.items | join(',')) | upper", "A,B"),
+        ("not (inputs.items | length)", False),
+    ],
+)
+def test_a_parenthesized_or_whole_filter_chain_still_evaluates(expr, value):
+    ctx = StepContext(inputs={"items": ["a", "b"]})
+
+    assert evaluate_expression("{{ " + expr + " }}", ctx) == value
+
+
 # Copilot round 3: the first two gates each inspected only one position. These pin
 # every-position scanning, both ends, and bracket-type matching.
 MULTI_POSITION_UNFIXABLE = [
@@ -478,17 +657,25 @@ MULTI_POSITION_UNFIXABLE = [
     ("in inputs.tags", "missing an operand"),             # leading word operator
     ("inputs.f(]", "brackets do not balance"),            # matched count, wrong types
     ("inputs.f(]", "brackets do not balance"),
-    ("inputs.items | length", "the evaluator rejects it"),
+    ("inputs.items | truncate", "the evaluator rejects it"),
     ("inputs.tags | join", "used in an unsupported form"),
-    ('he said "hi" then left', "is not a name the evaluator can resolve"),
-    ("inputs.count+1", "is not a valid path segment"),
-    ("inputs.a === inputs.b", "is not a name the evaluator can resolve"),
+    # The grammar-based engine names the position instead of classifying
+    # the text: `he said ...` fails at the second word, `count+1` at the `+1`
+    # (a signed number literal).
+    # Previously: "is not a name the evaluator can resolve" / "is not a valid
+    # path segment".
+    ('he said "hi" then left', "unexpected 'said'"),
+    ("inputs.count+1", "unexpected '+1' at column 13"),
+    ("inputs.a === inputs.b", "unexpected character '=' at column 12"),
     ("bogus == 'x'", "is not one of the namespace roots"),
     ("inputs.payload | from_json()", "the evaluator rejects it"),
-    # `_find_top_level` matches " and " with literal spaces, so a newline before
-    # the keyword is not an operator: the wrapped form evaluates False where the
-    # same expression with a space evaluates True.
-    ("inputs.x == 1\nand inputs.name == 'abc'", "is not a name the evaluator can resolve"),
+    # An operator after a filter chain has both operands: it is a filter
+    # precedence mistake, not a missing operand. A doubled `|` or operator is
+    # the missing operand.
+    ("inputs.items | length > 0", "ambiguous filter precedence"),
+    ("inputs.s | contains('h') and inputs.t", "ambiguous filter precedence"),
+    ("inputs.a || inputs.b", "missing an operand"),
+    ("inputs.a == == inputs.b", "missing an operand"),
 ]
 
 
@@ -501,6 +688,25 @@ def test_gates_inspect_every_position_not_just_the_first(step_cls, condition, ex
     assert len(errors) == 1
     assert "Wrap the expression" not in errors[0]
     assert expected in errors[0]
+
+
+@pytest.mark.parametrize("step_cls", STEP_CLASSES)
+def test_a_condition_wrapped_across_lines_gets_a_paste_ready_correction(step_cls):
+    """A line break before ``and`` no longer hides the operator.
+
+    The evaluator used to match " and " with literal spaces, so the wrapped form
+    of this condition read False where the one-line form read True, and the gate
+    had to withhold the correction. It now splits on any whitespace, so wrapping
+    repairs the condition and the correction is offered.
+    """
+    condition = "inputs.x == 1\nand inputs.name == 'abc'"
+    config = {"id": "s1", "condition": condition, "then": [], "steps": []}
+    errors = [e for e in step_cls().validate(config) if "'condition'" in e]
+
+    assert len(errors) == 1
+    assert "Wrap the expression" in errors[0]
+    ctx = StepContext(inputs={"x": 1, "name": "abc"})
+    assert evaluate_condition("{{ " + condition + " }}", ctx) is True
 
 
 @pytest.mark.parametrize(
@@ -537,10 +743,15 @@ def test_the_probe_reports_what_the_evaluator_reports():
     Asking the evaluator removes that class: any filter used under an unknown name
     or in an unsupported form is reported by the code that will run.
     """
-    assert _evaluator_rejects("inputs.items | length") is not None
+    assert _evaluator_rejects("inputs.items | truncate") is not None
     assert _evaluator_rejects("inputs.tags | join") is not None
     assert _evaluator_rejects("inputs.tags | join(',')") is None
     assert _evaluator_rejects("inputs.count > 100") is None
+    # A registered filter used in an unsupported form is a rejection too.
+    assert _evaluator_rejects("inputs.items | split") is not None
+    # Registered filters that are wired correctly are not.
+    assert _evaluator_rejects("inputs.items | length") is None
+    assert _evaluator_rejects("inputs.tags | split(',')") is None
 
 
 @pytest.mark.parametrize(
@@ -596,7 +807,12 @@ def test_probe_value_errors_are_not_treated_as_rejections(condition):
 
 @pytest.mark.parametrize(
     "condition",
-    ["inputs.items | length", "inputs.tags | join"],
+    [
+        "inputs.items | truncate",
+        "inputs.tags | join",
+        "inputs.items | split",
+        "inputs.text | upper('x')",
+    ],
 )
 def test_filter_wiring_errors_are_still_rejections(condition):
     """The other half: a filter named wrong or used wrong is the author's text."""
@@ -605,26 +821,36 @@ def test_filter_wiring_errors_are_still_rejections(condition):
 
 
 @pytest.mark.parametrize(
-    "condition,literal",
+    "condition,resolvable",
     [
         ("42", True),
         ("3.14", True),
         ("-7", True),
         # `1e3` has no "." so the evaluator calls int() on it, which fails; it then
-        # falls through to a path lookup. float() alone accepted it here.
+        # falls through to a path lookup and resolves to None. The gate used to
+        # decide this for itself with a float() test that accepted `1e3`, and the
+        # correction turned a truthy condition false. Now the evaluator reaches the
+        # dot-path resolution with `1e3` and reports it, so the two cannot disagree.
         ("1e3", False),
         ("'one'", True),
         ('"one"', True),
         # Two literals, not one: the evaluator requires the opening quote's match to
         # be the final character, which first/last-character equality does not.
         ("'a' 'b'", False),
-        ("'a' == 'b'", False),
+        ("'a' == 'b'", True),
         ("true", True),
-        ("inputs.name", False),
+        ("inputs.name", True),
+        ("bogus", False),
     ],
 )
-def test_literal_test_mirrors_the_evaluator(condition, literal):
-    assert _is_literal(condition) is literal
+def test_literal_handling_comes_from_the_evaluator(condition, resolvable):
+    """What `_is_literal` used to assert, asserted through the gate instead.
+
+    The helper existed only to restate the evaluator's literal tests, and its test
+    could pass while the two had drifted. Asking whether the gate accepts the
+    condition tests the property that actually matters.
+    """
+    assert (_unresolvable_term(condition) is None) is resolvable
 
 
 @pytest.mark.parametrize(
@@ -756,3 +982,137 @@ def test_indexing_an_always_mapping_root_still_loses_the_correction(condition):
     ctx = StepContext(inputs={"a": 1}, item=["x", "y"])
     assert CORRECTION_OFFERED not in format_condition_remediation(condition)
     assert evaluate_condition("{{ " + condition + " }}", ctx) is False
+
+
+# --- what the leaf walk rests on ----------------------------------------------
+
+
+def test_the_group_is_transparent_to_the_leaf_walk():
+    """The gate's operands are the names the evaluator's tree contains.
+
+    A parenthesised group is not itself a name: its operands are the leaves.
+    The parse-tree walk gets this from the grammar, so the assertion holds
+    without touching engine internals.
+    """
+    grouped = "(inputs.a or inputs.b) and inputs.c"
+    assert _collect_leaves(grouped) == ["inputs.a", "inputs.b", "inputs.c"]
+    assert expressions._unresolvable_term(grouped) is None
+
+
+def test_both_sides_of_a_boolean_are_reported():
+    """Probes must visit both operands even when runtime short-circuits."""
+    assert _collect_leaves("inputs.a or bogus") == ["inputs.a", "bogus"]
+    assert _collect_leaves("true or bogus") == ["bogus"]
+    assert _collect_leaves("false and bogus") == ["bogus"]
+    assert _unresolvable_term("false and bogus") is not None
+
+
+def test_a_long_boolean_chain_is_validated_without_exhausting_the_stack():
+    """Validation walks every operand of a long chain, the last one included."""
+    chain = " or ".join(["inputs.flag"] * 1000)
+    assert len(_collect_leaves(chain)) == 1000
+    assert _unresolvable_term(chain + " or bogus") is not None
+    errors = IfThenStep().validate({"id": "s1", "condition": chain, "then": []})
+    assert len(errors) == 1
+    assert "Wrap the expression" in errors[0]
+
+
+@pytest.mark.parametrize("template", ["true or ({})", "false and ({})", "true or (false and ({}))"])
+@pytest.mark.parametrize("filtered", ["inputs.x | nosuchfilter", "inputs.x | join", "inputs.x | length(1)"])
+def test_filter_probe_checks_short_circuited_operands(template, filtered):
+    expression = template.format(filtered)
+    assert _evaluator_rejects(expression) is not None
+    assert "evaluator rejects" in format_condition_remediation(expression)
+
+
+def test_leaves_seen_before_a_probe_error_are_kept():
+    """The probe hands `join` a placeholder and it raises. The leaves reached
+    before that are real, so discarding them would lose `bogus` -- the filter
+    argument case an earlier round of #4230 had to add by hand.
+    """
+    assert "bogus" in _collect_leaves("inputs.tags | join(bogus)")
+    assert _unresolvable_term("inputs.tags | join(bogus)") is not None
+
+
+def test_a_probe_error_does_not_end_the_filter_chain():
+    """Keeping the leaves seen so far is not enough -- the walk has to go on.
+
+    `from_json` receives the probe's placeholder mapping and raises. Stopping
+    there loses every leaf further along the chain, which is the one thing this
+    collection exists to report, and it is a step *backwards* from the
+    hand-written walk this refactor replaces: that walk read `bogus` straight
+    out of its own grammar rules and reported it.
+    """
+    expr = "inputs.blob | from_json | contains(bogus)"
+
+    assert _collect_leaves(expr) == ["inputs.blob", "bogus"]
+    assert _unresolvable_term(expr) is not None
+
+
+def test_every_later_link_of_a_chain_is_still_walked():
+    """Not merely the next link: two failing filters must not hide the third."""
+    expr = "inputs.blob | from_json | map(bogus) | join(alsobogus)"
+
+    leaves = _collect_leaves(expr)
+
+    assert "bogus" in leaves
+    assert "alsobogus" in leaves
+    assert _unresolvable_term(expr) is not None
+
+
+def test_only_the_probe_carries_on_past_a_filter_error():
+    """The continue-on-error is armed by the sink and nothing else.
+
+    A real evaluation must still fail loudly: `_apply_filter` raises rather than
+    return the unfiltered value precisely so a mis-wired filter cannot become a
+    quietly wrong answer, and the probe must not soften that.
+    """
+    context = StepContext(inputs={"blob": "not json", "tags": ["a"]})
+
+    with pytest.raises(ValueError, match="invalid JSON"):
+        evaluate_expression("{{ inputs.blob | from_json | contains('x') }}", context)
+
+    with pytest.raises(ValueError, match="unknown filter"):
+        evaluate_expression("{{ inputs.tags | nosuchfilter }}", context)
+
+    # And the rejection probe, which runs without the sink, still reports it.
+    assert _evaluator_rejects("inputs.tags | nosuchfilter") is not None
+
+
+def test_a_literal_never_reaches_the_resolver():
+    """Why the gate needs no literal test of its own any more."""
+    assert _collect_leaves("'a literal'") == []
+    assert _collect_leaves("42") == []
+    assert _collect_leaves("true") == []
+
+
+# --- The gate reads the evaluator's definitions, it does not restate them ---
+#
+# The point of this refactor is that widening what the evaluator accepts reaches
+# the validation gate for free. That is easy to claim and easy to lose: a second
+# copy of the grammar in the gate keeps every existing test green while silently
+# reintroducing the drift. This pins the wiring by moving the evaluator's own
+# definition and asserting the gate follows.
+
+
+def test_gate_reads_the_shared_indexed_segment_definition(monkeypatch):
+    """Widening `_INDEXED_SEGMENT` alone must reach the gate.
+
+    `steps.…​.task_list[+1]` is rejected today because `_INDEXED_SEGMENT` — the
+    one place `_resolve_dot_path` says what an index looks like — accepts an
+    optional minus sign and digits only. Widening it there and nowhere else must
+    be enough; if the gate keeps its own copy of the shape (as `_PATH_SEGMENT`
+    used to), this fails.
+
+    With the grammar-based engine this also pins that the parser's `PATH`
+    terminal is *derived* from `namespace`: the cache is keyed on the patterns,
+    so the widened definition rebuilds the parser instead of serving a stale
+    one. A grammar that hard-coded the segment shape would fail here.
+    """
+    path = "steps.tasks.output.task_list[+1].file"
+    assert expressions._unresolvable_term(path) is not None
+
+    monkeypatch.setattr(
+        namespace, "_INDEXED_SEGMENT", re.compile(r"^([\w-]+)\[([+-]?\d+)\]$")
+    )
+    assert expressions._unresolvable_term(path) is None
