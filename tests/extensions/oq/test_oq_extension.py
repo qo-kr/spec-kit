@@ -15,7 +15,7 @@ class TestOqExtensionManifest:
 
         manifest = ExtensionManifest(EXT_DIR / "extension.yml")
         assert manifest.id == "oq"
-        assert manifest.version == "1.0.0"
+        assert manifest.version == "1.1.0"
 
     def test_manifest_declares_expected_commands_and_aliases(self):
         from specify_cli.extensions import ExtensionManifest

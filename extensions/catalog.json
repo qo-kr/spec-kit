@@ -80,7 +80,7 @@
     "oq": {
       "name": "OQ Workflow Pack",
       "id": "oq",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "description": "OQ team's extended Speckit workflows for preparation, automated review, and full-auto execution.",
       "author": "qo-kr",
       "repository": "https://github.com/qo-kr/spec-kit",

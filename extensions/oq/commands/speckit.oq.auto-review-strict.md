@@ -71,7 +71,7 @@ Title에 `[STRICT]` 마커 추가:
 
 ### Step 3: Run Codex Review
 
-Same as `/speckit.auto-review`.
+Same as `/speckit.auto-review`: always through `.specify/extensions/oq/scripts/bash/codex-review.sh` (pinned model, PR base, recorded `OQ_REVIEWED_SHA`). Never call `codex review` directly.
 
 ### Step 4: Parse Codex Output + Claude 심층 리뷰
 
@@ -185,7 +185,8 @@ GitHub Issue: {issue_url} (closed)
 최종 상태: Sign-off (STRICT)
 
 ### 다음 단계
-- main 머지 준비 완료 (strict 검증 통과)
+- 리뷰한 SHA: {OQ_REVIEWED_SHA} (strict 검증 통과)
+- 머지 전 `.specify/extensions/oq/scripts/bash/merge-gate.sh --pr <N> --feature-dir <specs/NNN-…>` 실행
 ```
 
 ## Auto-Detect Test Command
@@ -194,13 +195,13 @@ Same as `/speckit.auto-review`.
 
 ## Behavior Rules
 
-- Maximum **15 rounds** (기본은 10) — strict는 LOW 수정으로 라운드가 늘어날 수 있음
+- Stop rule, round-4 refactor review, invariant ledger: same as `/speckit.auto-review` Step 9. Hard ceiling **15 rounds** (기본은 10) — strict는 LOW 수정으로 라운드가 늘어날 수 있음
 - **ALL severity levels** 수정 대상 (기본은 HIGH or MEDIUM만)
 - **셀프 체크** 매 수정 후 + 최종 1회
 - 셀프 체크 실패 시 **최대 2회 재시도** 후 PARTIAL로 기록
 - 최종 셀프 리뷰도 **최대 2회 재시도**
 - Post every round to the tracking GitHub issue
-- If codex review command fails, fall back to Claude-only strict review (Codex 없이도 진행)
+- If the codex review script fails, Claude may continue the strict review alone to keep fixing, but **that is not a sign-off for merge**: the final state is `리뷰 미수행 (Codex)` and the merge gate will fail until a wrapper-script review of the final SHA succeeds. (A Fable adversarial review is allowed by policy when Codex is down, but the gate does not read it: the user must decide to merge over the gate's `reviewed-sha FAIL` explicitly.)
 - Never ignore findings — fix or defer with explanation
 - Honestly mark stubs or placeholders
 
@@ -210,7 +211,7 @@ If `codex` CLI is not available:
 
 ```text
 ⚠️ codex CLI not available. Claude-only strict review로 진행합니다.
-(Codex 대신 Claude가 3축 전체를 단독 수행)
+(Codex 대신 Claude가 3축 전체를 단독 수행 — 단, 머지 가능 상태가 아님: 최종 SHA에 대한 Codex 또는 Fable 리뷰가 필요)
 ```
 
 ## 기본 auto-review와의 차이 요약

@@ -27,7 +27,7 @@ Fully automated collaborative review loop using `codex review` CLI. No user rela
 
 Before starting, verify the environment is ready:
 
-1. **codex CLI**: `which codex` — must exist
+1. **codex CLI**: `which codex` — must exist. The wrapper `.specify/extensions/oq/scripts/bash/codex-review.sh` must exist and be executable (reinstall the `oq` extension if not)
 2. **gh CLI**: `which gh` — must exist
 3. **Git branch**: not on main — must be on a feature branch
 4. **No cargo/build locks**: check for `target/debug/.cargo-lock` or running cargo processes. If found, warn and wait or kill.
@@ -75,29 +75,31 @@ Create a tracking issue with `gh issue create`:
 
 ### Step 3: Run Codex Review
 
-Execute `codex review --base main` with a **stage-specific prompt**:
+**Always run Codex through the OQ wrapper script. Never call `codex review` directly.**
 
 ```bash
-# For SPEC_REVIEW / PLAN_REVIEW (docs-only):
+# For SPEC_REVIEW / PLAN_REVIEW (docs-only): add a docs focus prompt.
 # Codex handles Axis 2 (defects in doc structure). Claude supplements Axis 1 (spec gap) + Axis 3 (test coverage planning).
-codex review --base main "Focus on document consistency: spec↔plan↔tasks alignment, terminology drift, missing acceptance criteria, ambiguous requirements, API naming conflicts between documents." 2>&1
+printf '%s\n' "Focus on document consistency: spec↔plan↔tasks alignment, terminology drift, missing acceptance criteria, ambiguous requirements, API naming conflicts between documents." > /tmp/oq-review-focus.txt
+.specify/extensions/oq/scripts/bash/codex-review.sh --prompt-file /tmp/oq-review-focus.txt
 
 # For IMPLEMENTATION_REVIEW / FINAL_REVIEW (code changes):
 # Codex handles Axis 2 (code defects). Claude supplements Axis 1 (spec gap) + Axis 3 (test coverage).
-codex review --base main 2>&1
+.specify/extensions/oq/scripts/bash/codex-review.sh
 ```
+
+What the script guarantees, so you do not re-check it by hand:
+- **Model is pinned** to `gpt-6.1-sol` (override only via `OQ_REVIEW_MODEL`; Astra and `*-ultrafast` are refused). The Codex banner's `model:` line must match, otherwise the script exits 4.
+- **Base is the open PR's base branch** (for OQ service repos usually `dev`), fetched from `origin`. Pass `--base <branch>` only when no PR exists yet.
+- **Reviewed SHA is recorded.** The tree must be clean (exit 3 otherwise) and HEAD must not move during the review. On success the script prints `OQ_REVIEWED_SHA=<sha>` and appends it to `.git/oq-reviews/ledger.tsv`, which the merge gate reads.
+- The full Codex output is at the path printed as `OQ_REVIEW_OUTPUT=`. Read that file for Step 4.
 
 **Codex review 후, Claude는 반드시 3축 심층 리뷰를 별도로 수행한다.**
 Codex가 LGTM이더라도 Claude가 3축 점검을 건너뛰어서는 안 된다.
 
-**Stage-specific prompts** ensure docs-only changes get proper review (codex defaults to code-focused analysis without guidance).
-
 **IMPORTANT**:
-- `codex review` runs non-interactively — it reads the git diff and outputs findings.
-- Capture the ENTIRE stdout output.
-- The output may be long (includes diff inspection + analysis + findings).
-- Timeout: 5 minutes max.
-- If `--base` and prompt conflict, use prompt only: `codex review "Review changes on branch X against main. Focus on..."` with `--base main` omitted.
+- A non-zero exit from the script means **no review happened for this SHA**. Do not count the round, do not treat it as sign-off. Report the exit code and the script's stderr line.
+- `codex review` (0.166) rejects `--base` together with a prompt and has no `-m` flag; the script already works around both. Do not "fix" it by calling Codex directly.
 
 ### Step 4: Parse Codex Output
 
@@ -136,12 +138,25 @@ gh issue comment {issue_number} --body "## Round {N} Fixes\n\n{fix_table}\n\nCom
 
 ### Step 8: Re-Run Codex Review
 
-Run `codex review --base main` again on the updated code.
+Run `.specify/extensions/oq/scripts/bash/codex-review.sh` again on the updated, committed code.
 
-### Step 9: Loop or Complete
+### Step 9: Loop, Stop, or Complete
 
-- If codex finds more issues → Go to Step 4
-- If codex output has no actionable findings → Sign-off
+Before starting the next round, tag every new finding as either **regression** (caused by the previous round's fix) or **fresh** (was already there). Then:
+
+1. **Stop rule** — if regressions are the majority of this round's findings, stop patching. Report the two options below and let the user choose; do not start another fix round on your own.
+
+   | | ① Follow-up issue, then merge | ② Refactor the core module |
+   |---|---|---|
+   | Allowed when | only P2/P3 remain | P0/P1 remain, or the same file/boundary keeps coming back |
+   | Touches | reversible surface (wording, test hygiene) | irreversible actions, external sends, credentials, data integrity, security |
+   | Leaves behind | an issue (what, why, counter-example, close condition) | a design with a *why* and a before/after diagram, then review from scratch |
+
+   If the call is split (e.g. P2 on a security boundary), lean to ②.
+2. **Round 4 and later** — before fixing anything in round 4, write a one-time refactor review into the tracking issue: does the same file show up every round? Are most findings regressions? Does one function hold several policies that fail in different directions? How many things must a newcomer hold at once to change it? Conclude (a) split now, (b) follow-up issue, or (c) not needed + why. Skipping the review is the only thing not allowed.
+3. **Invariant ledger** — from round 3, keep an invariant ledger in the tracking issue (one line = invariant + round that added it + what it prevents). Read it top to bottom before each fix and check the fix does not undo an earlier line.
+4. **P0/P1 never remain at sign-off.** Fix them, or stop and report.
+5. If codex output has no actionable findings and Claude's 3-axis review is clean → Sign-off **for the SHA printed as `OQ_REVIEWED_SHA`**. Any later commit (merge from base, conflict fix, version bump) needs another review round.
 
 ### Step 10: Completion
 
@@ -156,11 +171,13 @@ Output:
 
 총 라운드: {N}
 총 수정: {total_fixes}
+리뷰 모델: {OQ_REVIEW_MODEL} · 기준: {OQ_REVIEW_BASE}
+리뷰한 SHA: {OQ_REVIEWED_SHA}
 GitHub Issue: {issue_url} (closed)
 최종 상태: Sign-off
 
 ### 다음 단계
-- main 머지 준비 완료
+- 머지 전 `.specify/extensions/oq/scripts/bash/merge-gate.sh --pr <N> --feature-dir <specs/NNN-…>` 실행
 ```
 
 ## Auto-Detect Test Command
@@ -175,8 +192,8 @@ Look for these in order:
 
 ## Behavior Rules
 
-- Maximum 10 rounds — if not converging, stop and report
-- Each round: codex review + parse + fix + test + commit + push
+- Rounds end by the stop rule in Step 9, not by "until clean". Hard ceiling: 10 rounds — if reached, stop and report
+- Each round: codex review (via the wrapper script) + parse + fix + test + commit + push
 - Post every round to the tracking GitHub issue
 - If codex review command fails (timeout, auth error), stop and report the exact command, stderr, and next manual recovery step
 - Never ignore findings — fix or defer with explanation
