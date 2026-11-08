@@ -68,14 +68,22 @@ case "$BASE" in
     -*|*..*|*[!A-Za-z0-9._/-]*) die 2 "invalid base branch name: '$BASE'" ;;
 esac
 
-git fetch --quiet origin "$BASE" || die 2 "git fetch origin $BASE failed"
+# Fetch the branch explicitly and pin the commit we got. Never trust the short
+# name "origin/$BASE": a local branch called origin/<base> shadows it, and a
+# narrowed fetch refspec can leave the remote-tracking ref stale.
+git fetch --quiet origin "refs/heads/$BASE" || die 2 "git fetch origin refs/heads/$BASE failed"
+BASE_SHA="$(git rev-parse --verify --quiet 'FETCH_HEAD^{commit}')" || die 2 "fetch of $BASE produced no commit"
 BASE_REF="origin/$BASE"
-git rev-parse --verify --quiet "$BASE_REF^{commit}" >/dev/null || die 2 "$BASE_REF does not exist"
 
-[ -z "$(git status --porcelain)" ] || die 3 "working tree is dirty; commit first so the reviewed SHA covers every change"
+oq_is_clean || die 3 "working tree is dirty (untracked files and submodules included) or git status failed; commit first so the reviewed SHA covers every change"
 HEAD_SHA="$(git rev-parse HEAD)"
 
-PROMPT="Review the changes shown by: git diff ${BASE_REF}...${HEAD_SHA} (merge-base diff of this branch against ${BASE_REF}). Report every finding with a severity P0 (blocker), P1 (must fix before merge), P2 or P3, the file and line, and a concrete failure scenario. If there are no findings, say so explicitly."
+MERGE_BASE="$(git merge-base "$BASE_SHA" "$HEAD_SHA")" || die 2 "no merge base between $BASE_REF and HEAD"
+if git diff --quiet "$MERGE_BASE" "$HEAD_SHA" --; then
+    die 2 "nothing to review: HEAD has no changes against $BASE_REF ($BASE_SHA)"
+fi
+
+PROMPT="Review the changes shown by: git diff ${BASE_SHA}...${HEAD_SHA} (merge-base diff of this branch against ${BASE_REF}, pinned at ${BASE_SHA}). Report every finding with a severity P0 (blocker), P1 (must fix before merge), P2 or P3, the file and line, and a concrete failure scenario. If there are no findings, say so explicitly."
 if [ -n "$PROMPT_FILE" ]; then
     [ -f "$PROMPT_FILE" ] || die 2 "prompt file not found: $PROMPT_FILE"
     PROMPT="${PROMPT}
@@ -83,8 +91,7 @@ if [ -n "$PROMPT_FILE" ]; then
 $(cat "$PROMPT_FILE")"
 fi
 
-GIT_DIR="$(git rev-parse --absolute-git-dir)"
-REVIEW_DIR="$GIT_DIR/oq-reviews"
+REVIEW_DIR="$(oq_review_dir)" || die 2 "cannot locate the git common dir"
 mkdir -p "$REVIEW_DIR" || die 2 "cannot create $REVIEW_DIR"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT="$REVIEW_DIR/${HEAD_SHA:0:12}-${STAMP}.txt"
@@ -99,11 +106,15 @@ fi
 [ "$RC" -eq 0 ] || die "$RC" "codex review exited with $RC (output: $OUT)"
 
 [ "$(git rev-parse HEAD)" = "$HEAD_SHA" ] || die 3 "HEAD moved during the review; the review does not cover the new HEAD"
-[ -z "$(git status --porcelain)" ] || die 3 "the review left the working tree dirty; inspect before continuing"
+oq_is_clean || die 3 "the review left the working tree dirty (or git status failed); inspect before continuing"
 
-printf '%s\t%s\t%s\t%s\t%s\n' "$HEAD_SHA" "$BASE_REF" "$MODEL" "$STAMP" "$OUT" >>"$REVIEW_DIR/ledger.tsv"
+# Ledger columns: head sha, base ref, model, timestamp, output path, base sha.
+if ! printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$HEAD_SHA" "$BASE_REF" "$MODEL" "$STAMP" "$OUT" "$BASE_SHA" >>"$REVIEW_DIR/ledger.tsv"; then
+    die 2 "could not append to $REVIEW_DIR/ledger.tsv; the review is not recorded"
+fi
 
 echo "OQ_REVIEW_MODEL=$MODEL"
 echo "OQ_REVIEW_BASE=$BASE_REF"
+echo "OQ_REVIEW_BASE_SHA=$BASE_SHA"
 echo "OQ_REVIEWED_SHA=$HEAD_SHA"
 echo "OQ_REVIEW_OUTPUT=$OUT"

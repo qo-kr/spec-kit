@@ -6,7 +6,8 @@
 #
 #   1. pr-head        the PR's head SHA equals local HEAD (what you reviewed is what is pushed)
 #   2. reviewed-sha   codex-review.sh recorded a successful review of exactly that SHA
-#   3. value-doc      <feature-dir>/VALUE.md exists and is not empty
+#                     against the PR's current base branch
+#   3. value-doc      <feature-dir>/VALUE.md is a committed regular file with content
 #   4. postmortem     <feature-dir>/POSTMORTEM.md exists and is not empty
 #
 # Usage: merge-gate.sh --pr NUMBER --feature-dir specs/NNN-name [--method squash|merge|rebase]
@@ -43,9 +44,11 @@ report() { # name status detail
 . "$(dirname "$0")/oq-common.sh"
 LOCAL_HEAD="$(git rev-parse HEAD)"
 PR_HEAD=""
+PR_BASE=""
 REPO="$(oq_origin_repo)"
 if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
     PR_HEAD="$(gh pr view "$PR" -R "$REPO" --json headRefOid -q .headRefOid 2>/dev/null || true)"
+    PR_BASE="$(gh pr view "$PR" -R "$REPO" --json baseRefName -q .baseRefName 2>/dev/null || true)"
 fi
 
 if [ -z "$PR_HEAD" ]; then
@@ -56,12 +59,20 @@ else
     report pr-head FAIL "PR head $PR_HEAD != local HEAD $LOCAL_HEAD (push or pull first)"
 fi
 
-LEDGER="$(git rev-parse --absolute-git-dir)/oq-reviews/ledger.tsv"
+LEDGER="$(oq_review_dir 2>/dev/null)/ledger.tsv"
 TARGET="${PR_HEAD:-$LOCAL_HEAD}"
-if [ ! -f "$LEDGER" ]; then
+# A review only counts when it reviewed this exact SHA against the PR's
+# *current* base branch: a review against another base (or an empty diff) says
+# nothing about what this merge brings in, and --match-head-commit does not
+# protect against a PR being retargeted after the review.
+if [ -z "$PR_BASE" ]; then
+    report reviewed-sha UNMEASURED "could not read PR #$PR base branch with gh"
+elif [ ! -f "$LEDGER" ]; then
     report reviewed-sha FAIL "no review ledger at $LEDGER (run codex-review.sh)"
+elif awk -F'\t' -v s="$TARGET" -v b="origin/$PR_BASE" '$1 == s && $2 == b { found = 1 } END { exit !found }' "$LEDGER"; then
+    report reviewed-sha PASS "$(awk -F'\t' -v s="$TARGET" -v b="origin/$PR_BASE" '$1 == s && $2 == b { line = $3 " vs " $2 " at " $4 } END { print line }' "$LEDGER")"
 elif awk -F'\t' -v s="$TARGET" '$1 == s { found = 1 } END { exit !found }' "$LEDGER"; then
-    report reviewed-sha PASS "$(awk -F'\t' -v s="$TARGET" '$1 == s { line = $3 " vs " $2 " at " $4 } END { print line }' "$LEDGER")"
+    report reviewed-sha FAIL "$TARGET was reviewed, but not against the PR base origin/$PR_BASE; re-run codex-review.sh"
 else
     report reviewed-sha FAIL "$TARGET was never reviewed; re-run codex-review.sh on this SHA"
 fi
@@ -72,12 +83,20 @@ check_doc() { # name file
     else
         # Read the committed file at the SHA being merged, not the working tree:
         # an uncommitted VALUE.md would otherwise pass a gate it never reaches.
-        local path="${FEATURE_DIR%/}/$2" size
-        size="$(git cat-file -s "$TARGET:$path" 2>/dev/null || echo 0)"
-        if [ "$size" -gt 0 ]; then
-            report "$1" PASS "$path at ${TARGET:0:12}"
+        local path="${FEATURE_DIR%/}/$2" entry mode type
+        # Must be a regular file (not a directory, not a symlink) with
+        # non-blank content in the commit being merged.
+        entry="$(git ls-tree "$TARGET" -- "$path" 2>/dev/null)"
+        mode="${entry%% *}"
+        type="$(printf '%s' "$entry" | awk '{print $2}')"
+        if [ -z "$entry" ]; then
+            report "$1" FAIL "$path is missing at ${TARGET:0:12}"
+        elif [ "$type" != "blob" ] || { [ "$mode" != "100644" ] && [ "$mode" != "100755" ]; }; then
+            report "$1" FAIL "$path is not a regular file at ${TARGET:0:12} (mode $mode, $type)"
+        elif ! git cat-file blob "$TARGET:$path" 2>/dev/null | grep -q '[^[:space:]]'; then
+            report "$1" FAIL "$path is empty at ${TARGET:0:12}"
         else
-            report "$1" FAIL "$path is missing or empty at ${TARGET:0:12}"
+            report "$1" PASS "$path at ${TARGET:0:12}"
         fi
     fi
 }

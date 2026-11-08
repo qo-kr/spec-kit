@@ -1,6 +1,26 @@
 #!/usr/bin/env bash
 # Shared helpers for the OQ scripts. Source it; do not execute it.
 
+# Succeed only when the work tree is clean. Untracked files and submodule
+# changes count, whatever status.showUntrackedFiles / submodule settings say,
+# and a failing `git status` counts as not clean.
+oq_is_clean() {
+    local out
+    out="$(git -c status.showUntrackedFiles=all status --porcelain \
+        --untracked-files=all --ignore-submodules=none 2>/dev/null)" || return 1
+    [ -z "$out" ]
+}
+
+# Print the directory that holds the review ledger. It lives in the git
+# *common* dir, so a review made in one worktree is visible to the gate in
+# another worktree of the same repository.
+oq_review_dir() {
+    local common
+    common="$(git rev-parse --git-common-dir 2>/dev/null)" || return 1
+    common="$(cd "$common" 2>/dev/null && pwd -P)" || return 1
+    printf '%s/oq-reviews\n' "$common"
+}
+
 # Print "owner/name" of the GitHub repository behind the `origin` remote, or
 # nothing when origin is not a GitHub URL.
 #

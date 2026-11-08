@@ -80,8 +80,9 @@ Create a tracking issue with `gh issue create`:
 ```bash
 # For SPEC_REVIEW / PLAN_REVIEW (docs-only): add a docs focus prompt.
 # Codex handles Axis 2 (defects in doc structure). Claude supplements Axis 1 (spec gap) + Axis 3 (test coverage planning).
-printf '%s\n' "Focus on document consistency: spec↔plan↔tasks alignment, terminology drift, missing acceptance criteria, ambiguous requirements, API naming conflicts between documents." > /tmp/oq-review-focus.txt
-.specify/extensions/oq/scripts/bash/codex-review.sh --prompt-file /tmp/oq-review-focus.txt
+FOCUS="$(mktemp)"
+printf "%s\n" "Focus on document consistency: spec↔plan↔tasks alignment, terminology drift, missing acceptance criteria, ambiguous requirements, API naming conflicts between documents." > "$FOCUS"
+.specify/extensions/oq/scripts/bash/codex-review.sh --prompt-file "$FOCUS"; rm -f "$FOCUS"
 
 # For IMPLEMENTATION_REVIEW / FINAL_REVIEW (code changes):
 # Codex handles Axis 2 (code defects). Claude supplements Axis 1 (spec gap) + Axis 3 (test coverage).

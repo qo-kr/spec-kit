@@ -131,7 +131,9 @@ class TestCodexReview:
         assert 'model="gpt-6.1-sol"' in args
         assert "--base" not in args, "codex 0.166 rejects --base together with a prompt"
         prompt = args[-1]
-        assert f"git diff origin/dev...{head}" in prompt
+        base_sha = _git(work, "rev-parse", "refs/remotes/origin/dev")
+        assert f"git diff {base_sha}...{head}" in prompt
+        assert f"OQ_REVIEW_BASE_SHA={base_sha}" in result.stdout
 
         assert f"OQ_REVIEWED_SHA={head}" in result.stdout
         assert "OQ_REVIEW_BASE=origin/dev" in result.stdout
@@ -208,6 +210,50 @@ class TestCodexReview:
         assert not (stub / "codex-args").exists()
 
 
+    def test_local_branch_shadowing_origin_ref_is_ignored(self, repo):
+        work, stub = repo
+        head = _git(work, "rev-parse", "HEAD")
+        real_base = _git(work, "rev-parse", "refs/remotes/origin/dev")
+        _git(work, "branch", "origin/dev", head)  # shadows the short name origin/dev
+        result = _run(REVIEW, work, FAKE_BASE="dev")
+        assert result.returncode == 0, result.stderr
+        assert f"git diff {real_base}...{head}" in (stub / "codex-args").read_text()
+
+    def test_empty_diff_is_refused(self, repo):
+        work, stub = repo
+        _git(work, "push", "-q", "origin", "HEAD:refs/heads/same")
+        result = _run(REVIEW, work, "--base", "same")
+        assert result.returncode == 2
+        assert "nothing to review" in result.stderr
+        assert not (stub / "codex-args").exists()
+
+    def test_hidden_untracked_files_still_count_as_dirty(self, repo):
+        work, stub = repo
+        _git(work, "config", "status.showUntrackedFiles", "no")
+        (work / "sneaky.py").write_text("x = 1\n")
+        result = _run(REVIEW, work)
+        assert result.returncode == 3
+        assert not (stub / "codex-args").exists()
+
+    def test_unwritable_ledger_fails_without_success_markers(self, repo):
+        work, stub = repo
+        (work / ".git" / "oq-reviews" / "ledger.tsv").mkdir(parents=True)
+        result = _run(REVIEW, work)
+        assert result.returncode == 2
+        assert "OQ_REVIEWED_SHA" not in result.stdout
+
+    def test_ledger_is_shared_across_worktrees(self, repo, tmp_path):
+        work, stub = repo
+        wt = tmp_path / "wt"
+        _git(work, "worktree", "add", "-q", "-b", "feature2", str(wt))
+        (wt / "more.txt").write_text("more\n")
+        _git(wt, "add", ".")
+        _git(wt, "commit", "-q", "-m", "more")
+        result = _run(REVIEW, wt)
+        assert result.returncode == 0, result.stderr
+        assert _git(wt, "rev-parse", "HEAD") in _ledger(work).read_text()
+
+
 # ---------------------------------------------------------------- merge-gate.sh
 
 
@@ -221,7 +267,7 @@ class TestMergeGate:
         work, _ = repo
         _commit_docs(work, "VALUE.md", "POSTMORTEM.md")
         head = self._review(work)
-        result = _run(GATE, work, "--pr", "12", "--feature-dir", "specs/001-x", FAKE_PR_HEAD=head)
+        result = _run(GATE, work, "--pr", "12", "--feature-dir", "specs/001-x", FAKE_PR_HEAD=head, FAKE_BASE="main")
         assert result.returncode == 0, result.stdout + result.stderr
         assert "OQ_MERGE_GATE=PASS" in result.stdout
         assert (
@@ -233,7 +279,7 @@ class TestMergeGate:
         work, _ = repo
         _commit_docs(work, "POSTMORTEM.md")
         head = self._review(work)
-        result = _run(GATE, work, "--pr", "12", "--feature-dir", "specs/001-x", FAKE_PR_HEAD=head)
+        result = _run(GATE, work, "--pr", "12", "--feature-dir", "specs/001-x", FAKE_PR_HEAD=head, FAKE_BASE="main")
         assert result.returncode == 1
         assert "value-doc     FAIL" in result.stdout
         assert "OQ_MERGE_COMMAND" not in result.stdout
@@ -243,7 +289,7 @@ class TestMergeGate:
         _commit_docs(work, "POSTMORTEM.md")
         head = self._review(work)
         (work / "specs" / "001-x" / "VALUE.md").write_text("only on disk\n")
-        result = _run(GATE, work, "--pr", "12", "--feature-dir", "specs/001-x", FAKE_PR_HEAD=head)
+        result = _run(GATE, work, "--pr", "12", "--feature-dir", "specs/001-x", FAKE_PR_HEAD=head, FAKE_BASE="main")
         assert result.returncode == 1
         assert "value-doc     FAIL" in result.stdout
 
@@ -255,7 +301,7 @@ class TestMergeGate:
         _git(work, "add", ".")
         _git(work, "commit", "-q", "-m", "late commit")
         head = _git(work, "rev-parse", "HEAD")
-        result = _run(GATE, work, "--pr", "12", "--feature-dir", "specs/001-x", FAKE_PR_HEAD=head)
+        result = _run(GATE, work, "--pr", "12", "--feature-dir", "specs/001-x", FAKE_PR_HEAD=head, FAKE_BASE="main")
         assert result.returncode == 1
         assert "reviewed-sha  FAIL" in result.stdout
 
@@ -263,7 +309,7 @@ class TestMergeGate:
         work, _ = repo
         _commit_docs(work, "VALUE.md", "POSTMORTEM.md")
         self._review(work)
-        result = _run(GATE, work, "--pr", "12", "--feature-dir", "specs/001-x", FAKE_PR_HEAD="0" * 40)
+        result = _run(GATE, work, "--pr", "12", "--feature-dir", "specs/001-x", FAKE_PR_HEAD="0" * 40, FAKE_BASE="main")
         assert result.returncode == 1
         assert "pr-head       FAIL" in result.stdout
 
@@ -271,7 +317,7 @@ class TestMergeGate:
         work, _ = repo
         _commit_docs(work, "VALUE.md", "POSTMORTEM.md")
         head = self._review(work)
-        result = _run(GATE, work, "--pr", "12", FAKE_PR_HEAD=head)
+        result = _run(GATE, work, "--pr", "12", FAKE_PR_HEAD=head, FAKE_BASE="main")
         assert result.returncode == 1
         assert "value-doc     UNMEASURED" in result.stdout
         assert "OQ_MERGE_GATE=FAIL" in result.stdout
@@ -283,6 +329,50 @@ class TestMergeGate:
         result = _run(GATE, work, "--pr", "12", "--feature-dir", "specs/001-x")
         assert result.returncode == 1
         assert "pr-head       UNMEASURED" in result.stdout
+
+    def test_review_against_other_base_does_not_count(self, repo):
+        work, _ = repo
+        _commit_docs(work, "VALUE.md", "POSTMORTEM.md")
+        head = self._review(work)  # reviewed against origin/main
+        result = _run(GATE, work, "--pr", "12", "--feature-dir", "specs/001-x", FAKE_PR_HEAD=head, FAKE_BASE="dev")
+        assert result.returncode == 1
+        assert "reviewed-sha  FAIL" in result.stdout
+        assert "not against the PR base origin/dev" in result.stdout
+
+    def test_directory_named_like_a_doc_fails(self, repo):
+        work, _ = repo
+        for name in ("VALUE.md", "POSTMORTEM.md"):
+            d = work / "specs" / "001-x" / name
+            d.mkdir()
+            (d / "x.txt").write_text("unrelated\n")
+        _git(work, "add", ".")
+        _git(work, "commit", "-q", "-m", "dirs")
+        head = self._review(work)
+        result = _run(GATE, work, "--pr", "12", "--feature-dir", "specs/001-x", FAKE_PR_HEAD=head, FAKE_BASE="main")
+        assert result.returncode == 1
+        assert "value-doc     FAIL" in result.stdout and "not a regular file" in result.stdout
+
+    def test_symlink_doc_fails(self, repo):
+        work, _ = repo
+        _commit_docs(work, "POSTMORTEM.md")
+        (work / "specs" / "001-x" / "VALUE.md").symlink_to("/nonexistent/target-with-a-long-name")
+        _git(work, "add", ".")
+        _git(work, "commit", "-q", "-m", "link")
+        head = self._review(work)
+        result = _run(GATE, work, "--pr", "12", "--feature-dir", "specs/001-x", FAKE_PR_HEAD=head, FAKE_BASE="main")
+        assert result.returncode == 1
+        assert "value-doc     FAIL" in result.stdout
+
+    def test_blank_doc_fails(self, repo):
+        work, _ = repo
+        _commit_docs(work, "POSTMORTEM.md")
+        (work / "specs" / "001-x" / "VALUE.md").write_text("  \n\n")
+        _git(work, "add", ".")
+        _git(work, "commit", "-q", "-m", "blank")
+        head = self._review(work)
+        result = _run(GATE, work, "--pr", "12", "--feature-dir", "specs/001-x", FAKE_PR_HEAD=head, FAKE_BASE="main")
+        assert result.returncode == 1
+        assert "value-doc     FAIL" in result.stdout
 
     @pytest.mark.parametrize("args", [["--pr", "x"], ["--pr", "1", "--method", "force"], []])
     def test_bad_arguments(self, repo, args):
@@ -301,6 +391,7 @@ class TestCommandsUseScripts:
     )
     def test_review_commands_call_wrapper_not_codex_directly(self, name):
         text = (self.COMMANDS / name).read_text(encoding="utf-8")
+        assert "/tmp/" not in text, "use mktemp, not a predictable shared path"
         assert ".specify/extensions/oq/scripts/bash/codex-review.sh" in text
         assert "codex review --base" not in text
 
